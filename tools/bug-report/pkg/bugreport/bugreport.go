@@ -58,7 +58,7 @@ const (
 var (
 	bugReportDefaultIstioNamespace = "istio-system"
 	bugReportDefaultInclude        = []string{""}
-	bugReportDefaultExclude        = []string{"kube-system,kube-public"}
+	bugReportDefaultExclude        = []string{strings.Join(analyzer_util.SystemNamespaces, ", ")}
 )
 
 // Cmd returns a cobra command for bug-report.
@@ -143,7 +143,7 @@ func runBugReportCommand(_ *cobra.Command, logOpts *log.Options) error {
 
 	gatherInfo(client, config, resources, paths)
 	if len(gErrors) != 0 {
-		log.Errora(gErrors.ToError())
+		log.Error(gErrors.ToError())
 	}
 
 	// TODO: sort by importance and discard any over the size limit.
@@ -162,7 +162,7 @@ func runBugReportCommand(_ *cobra.Command, logOpts *log.Options) error {
 		outDir = "."
 	}
 	outPath := filepath.Join(outDir, "bug-report.tgz")
-	common.LogAndPrintf("Creating archive at %s.\n", outPath)
+	common.LogAndPrintf("Creating an archive at %s.\n", outPath)
 
 	archiveDir := archive.DirToArchive(tempDir)
 	if err := archive.Create(archiveDir, outPath); err != nil {

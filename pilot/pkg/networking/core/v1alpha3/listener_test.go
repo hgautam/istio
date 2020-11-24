@@ -36,6 +36,7 @@ import (
 	"github.com/golang/protobuf/ptypes"
 	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/google/go-cmp/cmp"
+	"gopkg.in/d4l3k/messagediff.v1"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
@@ -56,6 +57,7 @@ import (
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/util/protomarshal"
 )
 
 const (
@@ -94,17 +96,18 @@ var (
 		ConfigNamespace: "not-default",
 	}
 	proxyGateway = model.Proxy{
-		Type:        model.Router,
-		IPAddresses: []string{"1.1.1.1"},
-		ID:          "v0.default",
-		DNSDomain:   "default.example.org",
-		Metadata: &model.NodeMetadata{
-			Namespace: "not-default",
-			Labels: map[string]string{
-				"istio": "ingressgateway",
-			},
-		},
+		Type:            model.Router,
+		IPAddresses:     []string{"1.1.1.1"},
+		ID:              "v0.default",
+		DNSDomain:       "default.example.org",
+		Metadata:        &proxyGatewayMetadata,
 		ConfigNamespace: "not-default",
+	}
+	proxyGatewayMetadata = model.NodeMetadata{
+		Namespace: "not-default",
+		Labels: map[string]string{
+			"istio": "ingressgateway",
+		},
 	}
 	proxyInstances = []*model.ServiceInstance{
 		{
@@ -1452,7 +1455,7 @@ func TestOutboundListenerAccessLogs(t *testing.T) {
 	for _, l := range listeners {
 		if l.Name == VirtualOutboundListenerName {
 			fc := &tcp.TcpProxy{}
-			if err := getFilterConfig(l.FilterChains[0].Filters[0], fc); err != nil {
+			if err := getFilterConfig(l.FilterChains[1].Filters[0], fc); err != nil {
 				t.Fatalf("failed to get TCP Proxy config: %s", err)
 			}
 			if fc.AccessLog == nil {
@@ -1472,7 +1475,7 @@ func TestOutboundListenerAccessLogs(t *testing.T) {
 	// Trigger MeshConfig change and validate that access log is recomputed.
 	accessLogBuilder.reset()
 
-	// Validate that access log filter users the new format.
+	// Validate that access log filter uses the new format.
 	listeners = buildAllListeners(p, env)
 	for _, l := range listeners {
 		if l.Name == VirtualOutboundListenerName {
@@ -1502,7 +1505,7 @@ func TestListenerAccessLogs(t *testing.T) {
 	// Trigger MeshConfig change and validate that access log is recomputed.
 	accessLogBuilder.reset()
 
-	// Validate that access log filter users the new format.
+	// Validate that access log filter uses the new format.
 	listeners = buildAllListeners(p, env)
 	for _, l := range listeners {
 		if l.AccessLog[0].Filter == nil {
@@ -1516,10 +1519,82 @@ func TestListenerAccessLogs(t *testing.T) {
 	}
 }
 
+func TestListenerAccessLogsJSON(t *testing.T) {
+	t.Helper()
+	p := &fakePlugin{}
+	env := buildListenerEnv(nil)
+	env.Mesh().AccessLogFile = "foo"
+	listeners := buildAllListeners(p, env)
+
+	defaultFormatJSON, _ := protomarshal.ToJSON(EnvoyJSONLogFormat)
+
+	for _, tc := range []struct {
+		name       string
+		format     string
+		wantFormat string
+	}{
+		{
+			name:       "valid json object",
+			format:     `{"foo": "bar"}`,
+			wantFormat: `{"foo":"bar"}`,
+		},
+		{
+			name:       "valid nested json object",
+			format:     `{"foo": {"bar": "ha"}}`,
+			wantFormat: `{"foo":{"bar":"ha"}}`,
+		},
+		{
+			name:       "invalid json object",
+			format:     `foo`,
+			wantFormat: defaultFormatJSON,
+		},
+		{
+			name:       "incorrect json type",
+			format:     `[]`,
+			wantFormat: defaultFormatJSON,
+		},
+		{
+			name:       "incorrect json type",
+			format:     `"{}"`,
+			wantFormat: defaultFormatJSON,
+		},
+		{
+			name:       "empty string",
+			format:     ``,
+			wantFormat: defaultFormatJSON,
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			// Update MeshConfig
+			env.Mesh().AccessLogEncoding = meshconfig.MeshConfig_JSON
+			env.Mesh().AccessLogFormat = tc.format
+
+			// Trigger MeshConfig change and validate that access log is recomputed.
+			accessLogBuilder.reset()
+
+			// Validate that access log filter uses the new format.
+			listeners = buildAllListeners(p, env)
+			for _, l := range listeners {
+				if l.AccessLog[0].Filter == nil {
+					t.Fatal("expected filter config in listener access log configuration")
+				}
+				cfg, _ := conversion.MessageToStruct(l.AccessLog[0].GetTypedConfig())
+				jsonFormat := cfg.GetFields()["log_format"].GetStructValue().GetFields()["json_format"]
+				jsonFormatString, _ := protomarshal.ToJSON(jsonFormat)
+
+				if jsonFormatString != tc.wantFormat {
+					t.Fatalf("expected format to be %s, but got %s", tc.format, jsonFormatString)
+				}
+			}
+		})
+	}
+}
+
 func validateAccessLog(t *testing.T, l *listener.Listener, format string) {
 	t.Helper()
 	fc := &tcp.TcpProxy{}
-	if err := getFilterConfig(l.FilterChains[0].Filters[0], fc); err != nil {
+	if err := getFilterConfig(l.FilterChains[1].Filters[0], fc); err != nil {
 		t.Fatalf("failed to get TCP Proxy config: %s", err)
 	}
 	if fc.AccessLog == nil {
@@ -1565,9 +1640,35 @@ func TestHttpProxyListener_Tracing(t *testing.T) {
 		out              *hcm.HttpConnectionManager_Tracing
 		tproxy           *model.Proxy
 		envPilotSampling float64
+		disableIstioTags bool
 	}{
 		{
 			name:             "random-sampling-env",
+			tproxy:           getProxy(),
+			envPilotSampling: 80.0,
+			in: &meshconfig.Tracing{
+				Tracer:           nil,
+				CustomTags:       nil,
+				MaxPathTagLength: 0,
+				Sampling:         0,
+			},
+			out: &hcm.HttpConnectionManager_Tracing{
+				MaxPathTagLength: nil,
+				ClientSampling: &xdstype.Percent{
+					Value: 100.0,
+				},
+				RandomSampling: &xdstype.Percent{
+					Value: 80.0,
+				},
+				OverallSampling: &xdstype.Percent{
+					Value: 100.0,
+				},
+				CustomTags: defaultTags(),
+			},
+		},
+		{
+			name:             "random-sampling-env-without-istio-tags",
+			disableIstioTags: true,
 			tproxy:           getProxy(),
 			envPilotSampling: 80.0,
 			in: &meshconfig.Tracing{
@@ -1610,6 +1711,7 @@ func TestHttpProxyListener_Tracing(t *testing.T) {
 				OverallSampling: &xdstype.Percent{
 					Value: 100.0,
 				},
+				CustomTags: defaultTags(),
 			},
 		},
 		{
@@ -1633,6 +1735,7 @@ func TestHttpProxyListener_Tracing(t *testing.T) {
 				OverallSampling: &xdstype.Percent{
 					Value: 100.0,
 				},
+				CustomTags: defaultTags(),
 			},
 		},
 		{
@@ -1656,6 +1759,7 @@ func TestHttpProxyListener_Tracing(t *testing.T) {
 				OverallSampling: &xdstype.Percent{
 					Value: 100.0,
 				},
+				CustomTags: defaultTags(),
 			},
 		},
 		{
@@ -1679,6 +1783,7 @@ func TestHttpProxyListener_Tracing(t *testing.T) {
 				OverallSampling: &xdstype.Percent{
 					Value: 100.0,
 				},
+				CustomTags: defaultTags(),
 			},
 		},
 		{
@@ -1703,6 +1808,7 @@ func TestHttpProxyListener_Tracing(t *testing.T) {
 				OverallSampling: &xdstype.Percent{
 					Value: 100.0,
 				},
+				CustomTags: defaultTags(),
 			},
 		},
 		{
@@ -1727,11 +1833,85 @@ func TestHttpProxyListener_Tracing(t *testing.T) {
 				OverallSampling: &xdstype.Percent{
 					Value: 100.0,
 				},
+				CustomTags: defaultTags(),
 			},
 		},
 		{
 			name:   "custom-tags-sidecar",
 			tproxy: getProxy(),
+			in: &meshconfig.Tracing{
+				CustomTags: map[string]*meshconfig.Tracing_CustomTag{
+					"custom_tag_env": {
+						Type: &meshconfig.Tracing_CustomTag_Environment{
+							Environment: &meshconfig.Tracing_Environment{
+								Name:         "custom_tag_env-var",
+								DefaultValue: "custom-tag-env-default",
+							},
+						},
+					},
+					"custom_tag_request_header": {
+						Type: &meshconfig.Tracing_CustomTag_Header{
+							Header: &meshconfig.Tracing_RequestHeader{
+								Name:         "custom_tag_request_header_name",
+								DefaultValue: "custom-defaulted-value-request-header",
+							},
+						},
+					},
+					// leave this in non-alphanumeric order to verify
+					// the stable sorting doing when creating the custom tag filter
+					"custom_tag_literal": {
+						Type: &meshconfig.Tracing_CustomTag_Literal{
+							Literal: &meshconfig.Tracing_Literal{
+								Value: "literal-value",
+							},
+						},
+					},
+				},
+			},
+			out: &hcm.HttpConnectionManager_Tracing{
+				ClientSampling: &xdstype.Percent{
+					Value: 100.0,
+				},
+				RandomSampling: &xdstype.Percent{
+					Value: 100.0,
+				},
+				OverallSampling: &xdstype.Percent{
+					Value: 100.0,
+				},
+				CustomTags: append([]*tracing.CustomTag{
+					{
+						Tag: "custom_tag_env",
+						Type: &tracing.CustomTag_Environment_{
+							Environment: &tracing.CustomTag_Environment{
+								Name:         "custom_tag_env-var",
+								DefaultValue: "custom-tag-env-default",
+							},
+						},
+					},
+					{
+						Tag: "custom_tag_literal",
+						Type: &tracing.CustomTag_Literal_{
+							Literal: &tracing.CustomTag_Literal{
+								Value: "literal-value",
+							},
+						},
+					},
+					{
+						Tag: "custom_tag_request_header",
+						Type: &tracing.CustomTag_RequestHeader{
+							RequestHeader: &tracing.CustomTag_Header{
+								Name:         "custom_tag_request_header_name",
+								DefaultValue: "custom-defaulted-value-request-header",
+							},
+						},
+					},
+				}, defaultTags()...),
+			},
+		},
+		{
+			name:             "custom-tags-sidecar-without-istio-tags",
+			disableIstioTags: true,
+			tproxy:           getProxy(),
 			in: &meshconfig.Tracing{
 				CustomTags: map[string]*meshconfig.Tracing_CustomTag{
 					"custom_tag_env": {
@@ -1830,7 +2010,7 @@ func TestHttpProxyListener_Tracing(t *testing.T) {
 				MaxPathTagLength: &wrappers.UInt32Value{
 					Value: 100,
 				},
-				CustomTags: []*tracing.CustomTag{
+				CustomTags: append([]*tracing.CustomTag{
 					{
 						Tag: "custom_tag_request_header",
 						Type: &tracing.CustomTag_RequestHeader{
@@ -1839,8 +2019,7 @@ func TestHttpProxyListener_Tracing(t *testing.T) {
 								DefaultValue: "custom-defaulted-value-request-header",
 							},
 						},
-					},
-				},
+					}}, defaultTags()...),
 			},
 		},
 	}
@@ -1854,6 +2033,8 @@ func TestHttpProxyListener_Tracing(t *testing.T) {
 			pilotTraceSamplingEnv = tc.envPilotSampling
 			featuresSet = true
 		}
+
+		features.EnableIstioTags = !tc.disableIstioTags
 
 		env := buildListenerEnv(nil)
 		if err := env.PushContext.InitContext(&env, nil, nil); err != nil {
@@ -1893,10 +2074,10 @@ func verifyHTTPConnectionManagerFilter(t *testing.T, f *listener.Filter, expecte
 		}
 
 		tracing := cmgr.GetTracing()
-		ok := reflect.DeepEqual(tracing, expected)
+		diff, ok := messagediff.PrettyDiff(tracing, expected)
 
 		if !ok {
-			t.Fatalf("Testcase failure: %s custom tags did match not expected output", name)
+			t.Fatalf("Testcase failure: %s custom tags did match not expected output; diff: %v", name, diff)
 		}
 	}
 }
@@ -2602,7 +2783,7 @@ func TestOutboundRateLimitedThriftListenerConfig(t *testing.T) {
 
 	serviceDiscovery := memregistry.NewServiceDiscovery(services)
 
-	configStore := model.MakeIstioStore(memory.MakeWithoutValidation(collections.Pilot))
+	configStore := model.MakeIstioStore(memory.MakeSkipValidation(collections.Pilot, true))
 
 	m := mesh.DefaultMeshConfig()
 	m.ThriftConfig.RateLimitUrl = "ratelimit.svc.cluster.local"

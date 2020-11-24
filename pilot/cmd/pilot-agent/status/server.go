@@ -37,12 +37,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/expfmt"
 	"go.opencensus.io/stats/view"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"istio.io/istio/pilot/cmd/pilot-agent/metrics"
 	"istio.io/istio/pilot/cmd/pilot-agent/status/ready"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pkg/kube/apimirror"
 	"istio.io/pkg/env"
 	"istio.io/pkg/log"
 )
@@ -76,8 +76,8 @@ type KubeAppProbers map[string]*Prober
 
 // Prober represents a single container prober
 type Prober struct {
-	HTTPGet        *corev1.HTTPGetAction `json:"httpGet"`
-	TimeoutSeconds int32                 `json:"timeoutSeconds,omitempty"`
+	HTTPGet        *apimirror.HTTPGetAction `json:"httpGet"`
+	TimeoutSeconds int32                    `json:"timeoutSeconds,omitempty"`
 }
 
 // Config for the status server.
@@ -224,7 +224,7 @@ func (s *Server) Run(ctx context.Context) {
 
 	go func() {
 		if err := http.Serve(l, mux); err != nil {
-			log.Errora(err)
+			log.Error(err)
 			select {
 			case <-ctx.Done():
 				// We are shutting down already, don't trigger SIGTERM
@@ -432,7 +432,7 @@ func (s *Server) handleAppProbe(w http.ResponseWriter, req *http.Request) {
 		proberPath = "/" + proberPath
 	}
 	var url string
-	if prober.HTTPGet.Scheme == corev1.URISchemeHTTPS {
+	if prober.HTTPGet.Scheme == apimirror.URISchemeHTTPS {
 		url = fmt.Sprintf("https://localhost:%v%s", prober.HTTPGet.Port.IntValue(), proberPath)
 	} else {
 		url = fmt.Sprintf("http://localhost:%v%s", prober.HTTPGet.Port.IntValue(), proberPath)
@@ -456,7 +456,7 @@ func (s *Server) handleAppProbe(w http.ResponseWriter, req *http.Request) {
 			// Probe has specific host header override; honor it
 			appReq.Host = h.Value
 		} else {
-			appReq.Header.Add(h.Name, h.Value)
+			appReq.Header.Set(h.Name, h.Value)
 		}
 	}
 
@@ -481,7 +481,7 @@ func (s *Server) handleAppProbe(w http.ResponseWriter, req *http.Request) {
 func notifyExit() {
 	p, err := os.FindProcess(os.Getpid())
 	if err != nil {
-		log.Errora(err)
+		log.Error(err)
 	}
 	if err := p.Signal(syscall.SIGTERM); err != nil {
 		log.Errorf("failed to send SIGTERM to self: %v", err)

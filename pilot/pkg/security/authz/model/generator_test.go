@@ -228,6 +228,24 @@ func TestGenerator(t *testing.T) {
                   exact: foo`),
 		},
 		{
+			name:  "requestNestedClaimsGenerator",
+			g:     requestClaimGenerator{},
+			key:   "request.auth.claims[bar][baz]",
+			value: "foo",
+			want: yamlPrincipal(t, `
+         metadata:
+          filter: istio_authn
+          path:
+          - key: request.auth.claims
+          - key: bar
+          - key: baz
+          value:
+            listMatch:
+              oneOf:
+                stringMatch:
+                  exact: foo`),
+		},
+		{
 			name:  "hostGenerator",
 			g:     hostGenerator{},
 			value: "foo",
@@ -237,17 +255,8 @@ func TestGenerator(t *testing.T) {
           name: :authority`),
 		},
 		{
-			name:  "pathGenerator14",
-			g:     pathGenerator{isIstioVersionGE15: false},
-			value: "/abc",
-			want: yamlPermission(t, `
-         header:
-          exactMatch: /abc
-          name: :path`),
-		},
-		{
-			name:  "pathGenerator15",
-			g:     pathGenerator{isIstioVersionGE15: true},
+			name:  "pathGenerator",
+			g:     pathGenerator{},
 			value: "/abc",
 			want: yamlPermission(t, `
          urlPath:

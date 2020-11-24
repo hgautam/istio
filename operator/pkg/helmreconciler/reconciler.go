@@ -107,9 +107,6 @@ func NewHelmReconciler(client client.Client, restConfig *rest.Config, iop *value
 		iop = &valuesv1alpha1.IstioOperator{}
 		iop.Spec = &v1alpha1.IstioOperatorSpec{}
 	}
-	if operatorRevision, found := os.LookupEnv("REVISION"); found {
-		iop.Spec.Revision = operatorRevision
-	}
 	var cs *kubernetes.Clientset
 	var err error
 	if restConfig != nil {
@@ -237,7 +234,7 @@ func (h *HelmReconciler) Delete() error {
 	// Delete IOP with revision:
 	// for this case we update the status field to pending if there are still proxies pointing to this revision
 	// and we do not prune shared resources, same effect as `istioctl uninstall --revision foo` command.
-	status, err := h.PruneControlPlaneByRevisionWithController(iop.Spec.Namespace, iop.Spec.Revision)
+	status, err := h.PruneControlPlaneByRevisionWithController(valuesv1alpha1.Namespace(iop.Spec), iop.Spec.Revision)
 	if err != nil {
 		return err
 	}
@@ -362,14 +359,6 @@ func (h *HelmReconciler) getCoreOwnerLabels() (map[string]string, error) {
 	}
 	labels[istioVersionLabelStr] = version.Info.Version
 
-	return labels, nil
-}
-
-func (h *HelmReconciler) addComponentLabels(coreLabels map[string]string, componentName string) map[string]string {
-	labels := map[string]string{}
-	for k, v := range coreLabels {
-		labels[k] = v
-	}
 	revision := ""
 	if h.iop != nil {
 		revision = h.iop.Spec.Revision
@@ -378,6 +367,15 @@ func (h *HelmReconciler) addComponentLabels(coreLabels map[string]string, compon
 		revision = "default"
 	}
 	labels[label.IstioRev] = revision
+
+	return labels, nil
+}
+
+func (h *HelmReconciler) addComponentLabels(coreLabels map[string]string, componentName string) map[string]string {
+	labels := map[string]string{}
+	for k, v := range coreLabels {
+		labels[k] = v
+	}
 
 	labels[IstioComponentLabelStr] = componentName
 
