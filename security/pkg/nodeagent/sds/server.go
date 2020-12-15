@@ -16,24 +16,20 @@ package sds
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"net/http"
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 
 	ca2 "istio.io/istio/pkg/security"
 	"istio.io/istio/pkg/uds"
 	"istio.io/istio/security/pkg/nodeagent/plugin"
 	"istio.io/istio/security/pkg/nodeagent/plugin/providers/google/stsclient"
-	"istio.io/pkg/version"
 )
 
 const (
 	// base HTTP route for debug endpoints
-	debugBase     = "/debug"
 	maxStreams    = 100000
 	maxRetryTimes = 5
 )
@@ -53,19 +49,12 @@ func NewServer(options *ca2.Options, workloadSecretCache ca2.SecretManager) (*Se
 	s := &Server{
 		workloadSds: newSDSService(workloadSecretCache, options, options.FileMountedCerts),
 	}
-	if options.EnableWorkloadSDS {
-		if err := s.initWorkloadSdsService(options); err != nil {
-			sdsServiceLog.Errorf("Failed to initialize secret discovery service for workload proxies: %v", err)
-			return nil, err
-		}
-		sdsServiceLog.Infof("SDS gRPC server for workload UDS starts, listening on %q \n", options.WorkloadUDSPath)
+	if err := s.initWorkloadSdsService(options); err != nil {
+		sdsServiceLog.Errorf("Failed to initialize secret discovery service for workload proxies: %v", err)
+		return nil, err
 	}
+	sdsServiceLog.Infof("SDS gRPC server for workload UDS starts, listening on %q", options.WorkloadUDSPath)
 
-	version.Info.RecordComponentBuildTag("citadel_agent")
-
-	if options.DebugPort > 0 {
-		s.initDebugServer(options.DebugPort)
-	}
 	return s, nil
 }
 
@@ -104,44 +93,8 @@ func NewPlugins(in []string) []ca2.TokenExchanger {
 	return plugins
 }
 
-func (s *Server) initDebugServer(port int) {
-	mux := http.NewServeMux()
-	mux.HandleFunc(fmt.Sprintf("%s/sds/workload", debugBase), s.workloadSds.debugHTTPHandler)
-	s.debugServer = &http.Server{
-		Addr:    fmt.Sprintf("127.0.0.1:%d", port),
-		Handler: mux,
-	}
-
-	go func() {
-		err := s.debugServer.ListenAndServe()
-		sdsServiceLog.Errorf("debug server failure: %s", err)
-	}()
-}
-
-func (s *sdsservice) debugHTTPHandler(w http.ResponseWriter, req *http.Request) {
-	w.Header().Add("Content-Type", "application/json")
-
-	workloadJSON, err := s.DebugInfo()
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		failureMessage := fmt.Sprintf("debug endpoint failure: %s", err)
-		if _, err := w.Write([]byte(failureMessage)); err != nil {
-			sdsServiceLog.Errorf("debug endpoint failed to write error response: %s", err)
-		}
-		return
-	}
-	if _, err := w.Write([]byte(workloadJSON)); err != nil {
-		sdsServiceLog.Errorf("debug endpoint failed to write response: %s", err)
-	}
-}
-
-func (s *Server) initWorkloadSdsService(options *ca2.Options) error { //nolint: unparam
-	if options.GrpcServer != nil {
-		s.grpcWorkloadServer = options.GrpcServer
-		s.workloadSds.register(s.grpcWorkloadServer)
-		return nil
-	}
-	s.grpcWorkloadServer = grpc.NewServer(s.grpcServerOptions(options)...)
+func (s *Server) initWorkloadSdsService(options *ca2.Options) error { // nolint: unparam
+	s.grpcWorkloadServer = grpc.NewServer(s.grpcServerOptions()...)
 	s.workloadSds.register(s.grpcWorkloadServer)
 
 	var err error
@@ -180,18 +133,9 @@ func (s *Server) initWorkloadSdsService(options *ca2.Options) error { //nolint: 
 	return nil
 }
 
-func (s *Server) grpcServerOptions(options *ca2.Options) []grpc.ServerOption {
+func (s *Server) grpcServerOptions() []grpc.ServerOption {
 	grpcOptions := []grpc.ServerOption{
 		grpc.MaxConcurrentStreams(uint32(maxStreams)),
-	}
-
-	if options.CertFile != "" && options.KeyFile != "" {
-		creds, err := credentials.NewServerTLSFromFile(options.CertFile, options.KeyFile)
-		if err != nil {
-			sdsServiceLog.Errorf("Failed to load TLS keys: %s", err)
-			return nil
-		}
-		grpcOptions = append(grpcOptions, grpc.Creds(creds))
 	}
 
 	return grpcOptions

@@ -29,8 +29,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
-
 	pilotmodel "istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/mcp/status"
 	"istio.io/istio/pkg/security"
@@ -284,6 +282,7 @@ func (sc *SecretCache) addFileWatcher(file string, token string, connKey ConnKey
 	cacheLog.Infof("adding watcher for file %s", file)
 	if err := sc.certWatcher.Add(file); err != nil {
 		cacheLog.Errorf("%v: error adding watcher for file, skipping watches [%s] %v", connKey, file, err)
+		numFileWatcherFailures.Increment()
 		return
 	}
 	go func() {
@@ -302,6 +301,7 @@ func (sc *SecretCache) addFileWatcher(file string, token string, connKey ConnKey
 						// Regenerate the Secret and trigger the callback that pushes the secrets to proxy.
 						if _, secret, err := sc.generateFileSecret(ckey, token); err != nil {
 							cacheLog.Errorf("%v: error in generating secret after file change [%s] %v", ckey, file, err)
+							numFileSecretFailures.Increment()
 						} else {
 							cacheLog.Infof("%v: file changed, triggering secret push to proxy [%s]", ckey, file)
 							sc.callbackWithTimeout(ckey, secret)
@@ -779,10 +779,7 @@ func (sc *SecretCache) sendRetriableRequest(ctx context.Context, csrPEM []byte,
 	}
 	retryBackoffInMS := int64(firstRetryBackOffInMilliSec)
 
-	// Assign a unique request ID for all the retries.
-	reqID := uuid.New().String()
-
-	logPrefix := cacheLogPrefixWithReqID(connKey.ResourceName, reqID)
+	logPrefix := cacheLogPrefix(connKey.ResourceName)
 	startTime := time.Now()
 	var certChainPEM []string
 	exchangedToken := providedExchangedToken
@@ -799,8 +796,7 @@ func (sc *SecretCache) sendRetriableRequest(ctx context.Context, csrPEM []byte,
 				// if CSR request is without token, set the token to empty
 				exchangedToken = ""
 			}
-			certChainPEM, err = sc.fetcher.CaClient.CSRSign(
-				ctx, reqID, csrPEM, exchangedToken, int64(sc.configOptions.SecretTTL.Seconds()))
+			certChainPEM, err = sc.fetcher.CaClient.CSRSign(ctx, csrPEM, exchangedToken, int64(sc.configOptions.SecretTTL.Seconds()))
 		} else {
 			requestErrorString = fmt.Sprintf("%s TokExch", logPrefix)
 			p := sc.configOptions.TokenExchangers[0]

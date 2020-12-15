@@ -550,6 +550,21 @@ func TestValidateProxyConfig(t *testing.T) {
 			isValid: true,
 		},
 		{
+			name: "zipkin address with $(HOST_IP) is valid",
+			in: modify(valid,
+				func(c *meshconfig.ProxyConfig) {
+					c.Tracing = &meshconfig.Tracing{
+						Tracer: &meshconfig.Tracing_Zipkin_{
+							Zipkin: &meshconfig.Tracing_Zipkin{
+								Address: "$(HOST_IP):9411",
+							},
+						},
+					}
+				},
+			),
+			isValid: true,
+		},
+		{
 			name: "zipkin config invalid",
 			in: modify(valid,
 				func(c *meshconfig.ProxyConfig) {
@@ -2322,6 +2337,156 @@ func TestValidateVirtualService(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			warn, err := ValidateVirtualService(config.Config{Spec: tc.in})
+			checkValidation(t, warn, err, tc.valid, tc.warning)
+		})
+	}
+}
+
+func TestValidateWorkloadEntry(t *testing.T) {
+	testCases := []struct {
+		name    string
+		in      proto.Message
+		valid   bool
+		warning bool
+	}{
+		{
+			name:  "valid",
+			in:    &networking.WorkloadEntry{Address: "1.2.3.4"},
+			valid: true,
+		},
+		{
+			name:  "missing address",
+			in:    &networking.WorkloadEntry{},
+			valid: false,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			warn, err := ValidateWorkloadEntry(config.Config{Spec: tc.in})
+			checkValidation(t, warn, err, tc.valid, tc.warning)
+		})
+	}
+}
+
+func TestValidateWorkloadGroup(t *testing.T) {
+	testCases := []struct {
+		name    string
+		in      proto.Message
+		valid   bool
+		warning bool
+	}{
+		{
+			name:  "valid",
+			in:    &networking.WorkloadGroup{Template: &networking.WorkloadEntry{}},
+			valid: true,
+		},
+		{
+			name: "invalid",
+			in: &networking.WorkloadGroup{Template: &networking.WorkloadEntry{}, Metadata: &networking.WorkloadGroup_ObjectMeta{Labels: map[string]string{
+				".": "~",
+			}}},
+			valid: false,
+		},
+		{
+			name: "probe missing method",
+			in: &networking.WorkloadGroup{
+				Template: &networking.WorkloadEntry{},
+				Probe:    &networking.ReadinessProbe{},
+			},
+			valid: false,
+		},
+		{
+			name: "probe nil",
+			in: &networking.WorkloadGroup{
+				Template: &networking.WorkloadEntry{},
+				Probe: &networking.ReadinessProbe{
+					HealthCheckMethod: &networking.ReadinessProbe_HttpGet{},
+				},
+			},
+			valid: false,
+		},
+		{
+			name: "probe http empty",
+			in: &networking.WorkloadGroup{
+				Template: &networking.WorkloadEntry{},
+				Probe: &networking.ReadinessProbe{
+					HealthCheckMethod: &networking.ReadinessProbe_HttpGet{
+						HttpGet: &networking.HTTPHealthCheckConfig{},
+					},
+				},
+			},
+			valid: false,
+		},
+		{
+			name: "probe http valid",
+			in: &networking.WorkloadGroup{
+				Template: &networking.WorkloadEntry{},
+				Probe: &networking.ReadinessProbe{
+					HealthCheckMethod: &networking.ReadinessProbe_HttpGet{
+						HttpGet: &networking.HTTPHealthCheckConfig{
+							Port: 5,
+						},
+					},
+				},
+			},
+			valid: true,
+		},
+		{
+			name: "probe tcp invalid",
+			in: &networking.WorkloadGroup{
+				Template: &networking.WorkloadEntry{},
+				Probe: &networking.ReadinessProbe{
+					HealthCheckMethod: &networking.ReadinessProbe_TcpSocket{
+						TcpSocket: &networking.TCPHealthCheckConfig{},
+					},
+				},
+			},
+			valid: false,
+		},
+		{
+			name: "probe tcp valid",
+			in: &networking.WorkloadGroup{
+				Template: &networking.WorkloadEntry{},
+				Probe: &networking.ReadinessProbe{
+					HealthCheckMethod: &networking.ReadinessProbe_TcpSocket{
+						TcpSocket: &networking.TCPHealthCheckConfig{
+							Port: 5,
+						},
+					},
+				},
+			},
+			valid: true,
+		},
+		{
+			name: "probe exec invalid",
+			in: &networking.WorkloadGroup{
+				Template: &networking.WorkloadEntry{},
+				Probe: &networking.ReadinessProbe{
+					HealthCheckMethod: &networking.ReadinessProbe_Exec{
+						Exec: &networking.ExecHealthCheckConfig{},
+					},
+				},
+			},
+			valid: false,
+		},
+		{
+			name: "probe exec valid",
+			in: &networking.WorkloadGroup{
+				Template: &networking.WorkloadEntry{},
+				Probe: &networking.ReadinessProbe{
+					HealthCheckMethod: &networking.ReadinessProbe_Exec{
+						Exec: &networking.ExecHealthCheckConfig{
+							Command: []string{"foo", "bar"},
+						},
+					},
+				},
+			},
+			valid: true,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			warn, err := ValidateWorkloadGroup(config.Config{Spec: tc.in})
 			checkValidation(t, warn, err, tc.valid, tc.warning)
 		})
 	}

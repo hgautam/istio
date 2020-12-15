@@ -77,6 +77,7 @@ type operatorComponent struct {
 	installManifest map[string][]string
 	ingress         map[resource.ClusterIndex]map[string]ingress.Instance
 	workDir         string
+	deployTime      time.Duration
 }
 
 var _ io.Closer = &operatorComponent{}
@@ -154,12 +155,35 @@ func (i *operatorComponent) CustomIngressFor(cluster resource.Cluster, serviceNa
 	return i.ingress[cluster.Index()][istioLabel]
 }
 
+func appendToFile(contents string, file string) error {
+	f, err := os.OpenFile(file, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+	if err != nil {
+		return err
+	}
+
+	defer f.Close()
+
+	if _, err = f.WriteString(contents); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (i *operatorComponent) Close() error {
 	t0 := time.Now()
 	scopes.Framework.Infof("=== BEGIN: Cleanup Istio [Suite=%s] ===", i.ctx.Settings().TestID)
+
+	// Write time spent for cleanup and deploy to ARTIFACTS/trace.yaml and logs to allow analyzing test times
 	defer func() {
-		scopes.Framework.Infof("=== DONE: Cleanup Istio in %v [Suite=%s] ===", time.Since(t0), i.ctx.Settings().TestID)
+		delta := time.Since(t0)
+		y := fmt.Sprintf(`'suite/%s':
+  istio-deploy: %f
+  istio-cleanup: %f
+`, i.ctx.Settings().TestID, i.deployTime.Seconds(), delta.Seconds())
+		_ = appendToFile(y, filepath.Join(i.ctx.Settings().BaseDir, "trace.yaml"))
+		scopes.Framework.Infof("=== SUCCEEDED: Cleanup Istio in %v [Suite=%s] ===", delta, i.ctx.Settings().TestID)
 	}()
+
 	if i.settings.DeployIstio {
 		errG := multierror.Group{}
 		for _, cluster := range i.ctx.Clusters() {
@@ -188,7 +212,7 @@ func (i *operatorComponent) Close() error {
 				return
 			})
 		}
-		return errG.Wait()
+		return errG.Wait().ErrorOrNil()
 	}
 	return nil
 }
@@ -223,6 +247,10 @@ func deploy(ctx resource.Context, env *kube.Environment, cfg Config) (Instance, 
 		installManifest: map[string][]string{},
 		ingress:         map[resource.ClusterIndex]map[string]ingress.Instance{},
 	}
+	t0 := time.Now()
+	defer func() {
+		i.deployTime = time.Since(t0)
+	}()
 	i.id = ctx.TrackResource(i)
 
 	if !cfg.DeployIstio {
@@ -237,7 +265,7 @@ func deploy(ctx resource.Context, env *kube.Environment, cfg Config) (Instance, 
 	}
 	i.workDir = workDir
 
-	//generate istioctl config files for config, control plane(primary) and remote clusters
+	// generate istioctl config files for config, control plane(primary) and remote clusters
 	istioctlConfigFiles, err := createIstioctlConfigFile(workDir, cfg)
 	if err != nil {
 		return nil, err
@@ -492,6 +520,16 @@ func installControlPlaneCluster(i *operatorComponent, cfg Config, cluster resour
 	}
 
 	if cluster.IsConfig() {
+		// there are a few tests that require special gateway setup which will cause eastwest gateway fail to start
+		// exclude these tests from installing eastwest gw for now
+		testID := i.ctx.Settings().TestID
+		excludedTests := []string{"security_file_mounted_certs", "security_mtlsk8sca", "security_sds_ingress_k8sca"}
+		for _, t := range excludedTests {
+			if t == testID {
+				return nil
+			}
+		}
+
 		if err := i.deployEastWestGateway(cluster, spec.Revision); err != nil {
 			return err
 		}
@@ -609,7 +647,7 @@ func install(c *operatorComponent, installSettings []string, istioCtl istioctl.I
 		"--skip-confirmation",
 	}
 	cmd = append(cmd, installSettings...)
-	scopes.Framework.Infof("Running istio control plane on cluster %s %v", clusterName, cmd)
+	scopes.Framework.Infof("Installing Istio components on cluster %s %v", clusterName, cmd)
 	if _, _, err := istioCtl.Invoke(cmd); err != nil {
 		return fmt.Errorf("install failed: %v", err)
 	}

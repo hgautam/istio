@@ -30,15 +30,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 
 	meshapi "istio.io/api/mesh/v1alpha1"
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/util/sets"
 	"istio.io/istio/pilot/test/util"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/kube"
-)
-
-var (
-	nullWarningHandler = func(_ string) {}
 )
 
 // TestInjection tests both the mutating webhook and kube-inject. It does this by sharing the same input and output
@@ -52,6 +49,8 @@ func TestInjection(t *testing.T) {
 		mesh          func(m *meshapi.MeshConfig)
 		skipWebhook   bool
 		expectedError string
+		setup         func()
+		teardown      func()
 	}
 	cases := []testCase{
 		// verify cni
@@ -239,6 +238,34 @@ func TestInjection(t *testing.T) {
 			in:            "traffic-annotations-bad-excludeoutboundports.yaml",
 			expectedError: "excludeoutboundports",
 		},
+		{
+			in:   "hello.yaml",
+			want: "hello-no-seccontext.yaml.injected",
+			setup: func() {
+				features.EnableLegacyFSGroupInjection = false
+				os.Setenv("ENABLE_LEGACY_FSGROUP_INJECTION", "false")
+			},
+			teardown: func() {
+				features.EnableLegacyFSGroupInjection = true
+				os.Setenv("ENABLE_LEGACY_FSGROUP_INJECTION", "true")
+			},
+		},
+		{
+			in:   "proxy-override.yaml",
+			want: "proxy-override.yaml.injected",
+		},
+		{
+			in:   "explicit-security-context.yaml",
+			want: "explicit-security-context.yaml.injected",
+		},
+		{
+			in:   "only-proxy-container.yaml",
+			want: "only-proxy-container.yaml.injected",
+		},
+		{
+			in:   "proxy-override-args.yaml",
+			want: "proxy-override-args.yaml.injected",
+		},
 	}
 	// Keep track of tests we add options above
 	// We will search for all test files and skip these ones
@@ -287,7 +314,15 @@ func TestInjection(t *testing.T) {
 			testName = fmt.Sprintf("[%02d] %s", i, c.in)
 		}
 		t.Run(testName, func(t *testing.T) {
-			t.Parallel()
+			if c.setup != nil {
+				c.setup()
+			} else {
+				// Tests with custom setup modify global state and cannot run in parallel
+				t.Parallel()
+			}
+			if c.teardown != nil {
+				t.Cleanup(c.teardown)
+			}
 
 			mc, err := mesh.DeepCopyMeshConfig(defaultMesh)
 			if err != nil {
@@ -314,7 +349,10 @@ func TestInjection(t *testing.T) {
 			// First we test kube-inject. This will run exactly what kube-inject does, and write output to the golden files
 			t.Run("kube-inject", func(t *testing.T) {
 				var got bytes.Buffer
-				if err = IntoResourceFile(sidecarTemplate.Templates, valuesConfig, "", mc, in, &got, nullWarningHandler); err != nil {
+				warn := func(s string) {
+					t.Log(s)
+				}
+				if err = IntoResourceFile(sidecarTemplate.Templates, valuesConfig, "", mc, in, &got, warn); err != nil {
 					if c.expectedError != "" {
 						if !strings.Contains(strings.ToLower(err.Error()), c.expectedError) {
 							t.Fatalf("expected error %q got %q", c.expectedError, err)
@@ -349,6 +387,7 @@ func TestInjection(t *testing.T) {
 					Config:       sidecarTemplate,
 					meshConfig:   mc,
 					valuesConfig: valuesConfig,
+					revision:     "default",
 				}
 				// Split multi-part yaml documents. Input and output will have the same number of parts.
 				inputYAMLs := splitYamlFile(inputFilePath, t)
@@ -385,17 +424,13 @@ func testInjectionTemplate(t *testing.T, template, input, expected string) {
 	runWebhook(t, webhook, []byte(input), []byte(expected), false)
 }
 
-// TestPodTemplate ensures we can use a full pod resource as the template schema (rather than PodSpec)
+// TestPodTemplate ensures we can use a legacy pod spec resource as the template schema (rather than Pod)
 func TestPodSpecTemplate(t *testing.T) {
 	testInjectionTemplate(t,
 		`
-metadata:
-  labels:
-    istio.io/injected: "true"
-spec:
-  containers:
-  - name: hello
-    image: "fake.docker.io/google-samples/hello-go-gke:1.1"`,
+containers:
+- name: istio-proxy
+  image: proxy`,
 		`
 apiVersion: v1
 kind: Pod
@@ -419,18 +454,12 @@ metadata:
     prometheus.io/scrape: "true"
     sidecar.istio.io/status: '{"version":"","initContainers":["istio-init"],"containers":["istio-proxy"],"volumes":["istio-envoy","istio-data","istio-podinfo","istio-token","istiod-ca-cert"],"imagePullSecrets":null}'
   name: hello
-  labels:
-    istio.io/injected: "true"
-    istio.io/rev: ""
-    security.istio.io/tlsMode: istio
-    service.istio.io/canonical-name: hello
-    service.istio.io/canonical-revision: latest
 spec:
   containers:
     - name: hello
-      image: "fake.docker.io/google-samples/hello-go-gke:1.1"
-  securityContext:
-    fsGroup: 1337
+      image: fake.docker.io/google-samples/hello-go-gke:1.0
+    - name: istio-proxy
+      image: proxy
 `)
 }
 
@@ -439,28 +468,26 @@ spec:
 func TestStrategicMerge(t *testing.T) {
 	testInjectionTemplate(t,
 		`
-containers:
-- name: hello
-  image: "fake.docker.io/google-samples/hello-go-gke:1.1"
-  resources:
+metadata:
+  labels:
     $patch: replace
-    limits:
-      cpu: 100m
-      memory: 50m
+    foo: bar
+spec:
+  containers:
+  - name: injected
+    image: "fake.docker.io/google-samples/hello-go-gke:1.1"
 `,
 		`
 apiVersion: v1
 kind: Pod
 metadata:
   name: hello
+  labels:
+    key: value
 spec:
   containers:
   - name: hello
     image: "fake.docker.io/google-samples/hello-go-gke:1.0"
-    resources:
-      requests:
-        cpu: 100m
-        memory: 50m
 `,
 
 		// We expect resources to only have limits, since we had the "replace" directive.
@@ -473,23 +500,15 @@ metadata:
     prometheus.io/path: /stats/prometheus
     prometheus.io/port: "0"
     prometheus.io/scrape: "true"
-    sidecar.istio.io/status: '{"version":"","initContainers":["istio-init"],"containers":["istio-proxy"],"volumes":["istio-envoy","istio-data","istio-podinfo","istio-token","istiod-ca-cert"],"imagePullSecrets":null}'
-  name: hello
   labels:
-    istio.io/rev: ""
-    security.istio.io/tlsMode: istio
-    service.istio.io/canonical-name: hello
-    service.istio.io/canonical-revision: latest
+    foo: bar
+  name: hello
 spec:
   containers:
-  - name: hello
+  - name: injected
     image: "fake.docker.io/google-samples/hello-go-gke:1.1"
-    resources:
-     limits:
-       cpu: 100m
-       memory: 50m
-  securityContext:
-    fsGroup: 1337
+  - name: hello
+    image: "fake.docker.io/google-samples/hello-go-gke:1.0"
 `)
 }
 

@@ -14,6 +14,7 @@ spec:
   template:
     metadata:
       annotations:
+        kubectl.kubernetes.io/default-logs-container: user-volume
         prometheus.io/path: /stats/prometheus
         prometheus.io/port: "15020"
         prometheus.io/scrape: "true"
@@ -23,7 +24,7 @@ spec:
       creationTimestamp: null
       labels:
         app: user-volume
-        istio.io/rev: ""
+        istio.io/rev: default
         security.istio.io/tlsMode: istio
         service.istio.io/canonical-name: user-volume
         service.istio.io/canonical-revision: latest
@@ -217,6 +218,16 @@ spec:
           - fieldRef:
               fieldPath: metadata.annotations
             path: annotations
+          - path: cpu-limit
+            resourceFieldRef:
+              containerName: istio-proxy
+              divisor: 1m
+              resource: limits.cpu
+          - path: cpu-request
+            resourceFieldRef:
+              containerName: istio-proxy
+              divisor: 1m
+              resource: requests.cpu
         name: istio-podinfo
       - name: istio-token
         projected:

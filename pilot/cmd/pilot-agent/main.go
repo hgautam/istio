@@ -212,7 +212,7 @@ var (
 			// operational parameters correctly.
 			proxyIPv6 := isIPv6Proxy(role.IPAddresses)
 
-			proxyConfig, err := constructProxyConfig()
+			proxyConfig, err := constructProxyConfig(role)
 			if err != nil {
 				return fmt.Errorf("failed to get proxy config: %v", err)
 			}
@@ -256,7 +256,6 @@ var (
 				secOpts.CAEndpoint = proxyConfig.DiscoveryAddress
 			}
 
-			secOpts.EnableWorkloadSDS = true
 			secOpts.CAProviderName = caProviderEnv
 
 			secOpts.TrustDomain = trustDomainEnv
@@ -349,6 +348,7 @@ var (
 				Node:                role.ServiceNode(),
 				LogLevel:            proxyLogLevel,
 				ComponentLogLevel:   proxyComponentLogLevel,
+				LogAsJSON:           loggingOptions.JSONEncoding,
 				PilotSubjectAltName: pilotSAN,
 				NodeIPs:             role.IPAddresses,
 				STSPort:             stsPort,

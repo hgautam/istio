@@ -51,7 +51,7 @@ const (
 	// Location to read istioctl defaults from
 	defaultIstioctlConfig = "$HOME/.istioctl/config.yaml"
 
-	//deprection messages to be suffixed to the deprecated commands
+	// deprecation messages to be suffixed to the deprecated commands
 	deprecatedMsg = "[Deprecated, it will be removed in Istio 1.9]"
 
 	// ExperimentalMsg indicate active development and not for production use warning.
@@ -246,11 +246,6 @@ debug and diagnose their Istio mesh.
 	analyzeCmd := Analyze()
 	hideInheritedFlags(analyzeCmd, "istioNamespace")
 	rootCmd.AddCommand(analyzeCmd)
-
-	convertIngressCmd := convertIngress()
-	deprecate(convertIngressCmd)
-	hideInheritedFlags(convertIngressCmd, "namespace", "istioNamespace")
-	rootCmd.AddCommand(convertIngressCmd)
 
 	dashboardCmd := dashboard()
 	hideInheritedFlags(dashboardCmd, "namespace", "istioNamespace")

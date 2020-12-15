@@ -29,6 +29,7 @@ import (
 	"istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/model/status"
 	"istio.io/istio/pilot/pkg/networking/util"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/schema/gvk"
@@ -73,6 +74,7 @@ func (sg *InternalGen) RegisterWorkload(proxy *model.Proxy, con *Connection) err
 	})
 	// TODO return err from Patch through Get
 	if err == nil {
+		adsLog.Debugf("updated auto-registered WorkloadEntry %s/%s", proxy.Metadata.Namespace, entryName)
 		return nil
 	} else if !errors.IsNotFound(err) && err.Error() != "item not found" {
 		adsLog.Errorf("updating auto-registered WorkloadEntry %s/%s: %v", proxy.Metadata.Namespace, entryName, err)
@@ -94,6 +96,11 @@ func (sg *InternalGen) RegisterWorkload(proxy *model.Proxy, con *Connection) err
 		adsLog.Errorf("auto-registration of %v failed: error creating WorkloadEntry: %v", proxy.ID, err)
 		return fmt.Errorf("auto-registration of %v failed: error creating WorkloadEntry: %v", proxy.ID, err)
 	}
+	hcMessage := ""
+	if _, f := entry.Annotations[status.WorkloadEntryHealthCheckAnnotation]; f {
+		hcMessage = " with health checking enabled"
+	}
+	adsLog.Infof("auto-registered WorkloadEntry %s/%s%s", proxy.Metadata.Namespace, entryName, hcMessage)
 	return nil
 }
 
@@ -145,9 +152,6 @@ func (sg *InternalGen) QueueUnregisterWorkload(proxy *model.Proxy) {
 // UpdateWorkloadEntryHealth updates the associated WorkloadEntries health status
 // based on the corresponding health check performed by istio-agent.
 func (sg *InternalGen) UpdateWorkloadEntryHealth(proxy *model.Proxy, event HealthEvent) {
-	if !features.WorkloadEntryHealthChecks {
-		return
-	}
 	// we assume that the workload entry exists
 	// if auto registration does not exist, try looking
 	// up in NodeMetadata
@@ -163,20 +167,9 @@ func (sg *InternalGen) UpdateWorkloadEntryHealth(proxy *model.Proxy, event Healt
 		adsLog.Errorf("config was nil when getting WorkloadEntry %v for %v", entryName, proxy.ID)
 		return
 	}
-	wle := cfg.DeepCopy()
 
 	// replace the updated status
-	// should this status nil check be in the initial auto registration?
-	var status *v1alpha1.IstioStatus
-	if wle.Status == nil {
-		// for some reason we have a nil status, just make conditions
-		// an empty array
-		wle.Status = &v1alpha1.IstioStatus{
-			Conditions: []*v1alpha1.IstioCondition{},
-		}
-	}
-	status = wle.Status.(*v1alpha1.IstioStatus)
-	status.Conditions = UpdateHealthCondition(status.Conditions, event)
+	wle := status.UpdateConfigCondition(*cfg, transformHealthEvent(event))
 
 	// update the status
 	_, err := sg.store.UpdateStatus(wle)
@@ -222,6 +215,7 @@ func (sg *InternalGen) cleanupEntry(wle config.Config) {
 	if err := sg.store.Delete(gvk.WorkloadEntry, wle.Name, wle.Namespace); err != nil {
 		adsLog.Warnf("failed cleaning up auto-registered WorkloadEntry %s/%s: %v", wle.Namespace, wle.Name, err)
 	}
+	adsLog.Infof("cleaned up auto-registered WorkloadEntry %s/%s", wle.Namespace, wle.Name)
 }
 
 func shouldCleanupEntry(wle config.Config) bool {
@@ -257,7 +251,18 @@ func workloadEntryFromGroup(name string, proxy *model.Proxy, groupCfg *config.Co
 	entry := group.Template.DeepCopy()
 	entry.Address = proxy.IPAddresses[0]
 	// TODO move labels out of entry
-	entry.Labels = mergeLabels(entry.Labels, proxy.Metadata.Labels)
+	// node metadata > WorkloadGroup.Metadata > WorkloadGroup.Template
+	if group.Metadata != nil && group.Metadata.Labels != nil {
+		entry.Labels = mergeLabels(entry.Labels, group.Metadata.Labels)
+	}
+	if proxy.Metadata != nil && proxy.Metadata.Labels != nil {
+		entry.Labels = mergeLabels(entry.Labels, proxy.Metadata.Labels)
+	}
+
+	annotations := map[string]string{AutoRegistrationGroupAnnotation: groupCfg.Name}
+	if group.Metadata != nil && group.Metadata.Annotations != nil {
+		annotations = mergeLabels(annotations, group.Metadata.Annotations)
+	}
 
 	if proxy.Metadata.Network != "" {
 		entry.Network = proxy.Metadata.Network
@@ -265,13 +270,17 @@ func workloadEntryFromGroup(name string, proxy *model.Proxy, groupCfg *config.Co
 	if proxy.Locality != nil {
 		entry.Locality = util.LocalityToString(proxy.Locality)
 	}
+	if proxy.Metadata.ProxyConfig != nil && proxy.Metadata.ProxyConfig.ReadinessProbe != nil {
+		annotations[status.WorkloadEntryHealthCheckAnnotation] = "true"
+	}
+
 	return &config.Config{
 		Meta: config.Meta{
 			GroupVersionKind: gvk.WorkloadEntry,
 			Name:             name,
 			Namespace:        proxy.Metadata.Namespace,
 			Labels:           entry.Labels,
-			Annotations:      map[string]string{AutoRegistrationGroupAnnotation: groupCfg.Name},
+			Annotations:      annotations,
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: groupCfg.GroupVersionKind.GroupVersion(),
 				Kind:       groupCfg.GroupVersionKind.Kind,
@@ -290,7 +299,7 @@ func mergeLabels(labels ...map[string]string) map[string]string {
 	if len(labels) == 0 {
 		return map[string]string{}
 	}
-	out := make(map[string]string, len(labels)*len(labels[1]))
+	out := make(map[string]string, len(labels)*len(labels[0]))
 	for _, lm := range labels {
 		for k, v := range lm {
 			out[k] = v
@@ -324,39 +333,19 @@ func autoregisteredWorkloadEntryName(proxy *model.Proxy) string {
 	return name
 }
 
-func UpdateHealthCondition(conditions []*v1alpha1.IstioCondition, event HealthEvent) []*v1alpha1.IstioCondition {
-	foundHealth := false
-	healthIdx := 0
-	for i, cond := range conditions {
-		if cond.Type == "Healthy" {
-			foundHealth = true
-			healthIdx = i
-			break
-		}
-	}
-	if !foundHealth {
-		// we have not inserted a healthy condition yet
-		// just append and return
-		return append(conditions, transformHealthEvent(event))
-	}
-	// we should just replace the health status
-	conditions[healthIdx] = transformHealthEvent(event)
-	return conditions
-}
-
 func transformHealthEvent(event HealthEvent) *v1alpha1.IstioCondition {
 	cond := &v1alpha1.IstioCondition{
-		Type: "Healthy",
+		Type: status.ConditionHealthy,
 		// last probe and transition are the same because
 		// we only send on transition in the agent
 		LastProbeTime:      types.TimestampNow(),
 		LastTransitionTime: types.TimestampNow(),
 	}
 	if event.Healthy {
-		cond.Status = "True"
+		cond.Status = status.StatusTrue
 		return cond
 	}
-	cond.Status = "False"
+	cond.Status = status.StatusFalse
 	cond.Message = event.Message
 	return cond
 }
