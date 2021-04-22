@@ -15,6 +15,8 @@
 package option
 
 import (
+	"strings"
+
 	"github.com/gogo/protobuf/types"
 
 	meshAPI "istio.io/api/mesh/v1alpha1"
@@ -22,9 +24,11 @@ import (
 	"istio.io/istio/pilot/pkg/model"
 )
 
-type LocalhostValue string
-type WildcardValue string
-type DNSLookupFamilyValue string
+type (
+	LocalhostValue       string
+	WildcardValue        string
+	DNSLookupFamilyValue string
+)
 
 const (
 	LocalhostIPv4       LocalhostValue       = "127.0.0.1"
@@ -35,7 +39,7 @@ const (
 	DNSLookupFamilyIPv6 DNSLookupFamilyValue = "AUTO"
 )
 
-func ProxyConfig(value *meshAPI.ProxyConfig) Instance {
+func ProxyConfig(value *model.NodeMetaProxyConfig) Instance {
 	return newOption("config", value)
 }
 
@@ -53,6 +57,15 @@ func Cluster(value string) Instance {
 
 func NodeID(value string) Instance {
 	return newOption("nodeID", value)
+}
+
+func NodeType(value string) Instance {
+	ntype := strings.Split(value, "~")[0]
+	return newOption("nodeType", ntype)
+}
+
+func XdsType(value string) Instance {
+	return newOption("xds_type", value)
 }
 
 func Region(value string) Instance {
@@ -217,12 +230,6 @@ func STSEnabled(value bool) Instance {
 
 func ProvCert(value string) Instance {
 	return newOption("provisioned_cert", value)
-}
-
-// CallCredentials will trigger the google_grpc XDS interface, with the given
-// call credentials.
-func CallCredentials(value bool) Instance {
-	return newOption("call_credentials", value)
 }
 
 func DiscoveryHost(value string) Instance {

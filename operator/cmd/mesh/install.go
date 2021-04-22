@@ -23,6 +23,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"k8s.io/client-go/rest"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"istio.io/api/operator/v1alpha1"
 	"istio.io/istio/istioctl/pkg/clioptions"
@@ -40,7 +42,6 @@ import (
 	"istio.io/istio/operator/pkg/util/progress"
 	pkgversion "istio.io/istio/operator/pkg/version"
 	operatorVer "istio.io/istio/operator/version"
-	"istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/kube"
 	"istio.io/pkg/log"
@@ -119,7 +120,8 @@ func InstallCmd(logOpts *log.Options) *cobra.Command {
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runApplyCmd(cmd, rootArgs, iArgs, logOpts)
-		}}
+		},
+	}
 
 	addFlags(ic, rootArgs)
 	addInstallFlags(ic, iArgs)
@@ -133,20 +135,32 @@ func runApplyCmd(cmd *cobra.Command, rootArgs *rootArgs, iArgs *installArgs, log
 	if err != nil {
 		return err
 	}
+	restConfig, clientset, client, err := K8sConfig(iArgs.kubeConfigPath, iArgs.context)
+	if err != nil {
+		return err
+	}
+	if err := k8sversion.IsK8VersionSupported(clientset, l); err != nil {
+		return err
+	}
 	tag, err := GetTagVersion(operatorVer.OperatorVersionString)
 	if err != nil {
 		return err
 	}
 	setFlags := applyFlagAliases(iArgs.set, iArgs.manifestsPath, iArgs.revision)
 
-	profile, ns, enabledComponents, err := getProfileNSAndEnabledComponents(setFlags, iArgs.inFilenames, iArgs.force, l)
+	_, iop, err := manifest.GenerateConfig(iArgs.inFilenames, setFlags, iArgs.force, restConfig, l)
+	if err != nil {
+		return err
+	}
+
+	profile, ns, enabledComponents, err := getProfileNSAndEnabledComponents(iop)
 	if err != nil {
 		return fmt.Errorf("failed to get profile, namespace or enabled components: %v", err)
 	}
 
 	// Ignore the err because we don't want to show
 	// "no running Istio pods in istio-system" for the first time
-	_ = DetectIstioVersionDiff(cmd, tag, ns, kubeClient, iArgs)
+	_ = DetectIstioVersionDiff(cmd, tag, ns, kubeClient, setFlags)
 
 	// Warn users if they use `istioctl install` without any config args.
 	if !rootArgs.dryRun && !iArgs.skipConfirmation {
@@ -162,8 +176,7 @@ func runApplyCmd(cmd *cobra.Command, rootArgs *rootArgs, iArgs *installArgs, log
 	if err := configLogs(logOpts); err != nil {
 		return fmt.Errorf("could not configure logs: %s", err)
 	}
-	iop, err := InstallManifests(setFlags, iArgs.inFilenames, iArgs.force, rootArgs.dryRun,
-		iArgs.kubeConfigPath, iArgs.context, iArgs.readinessTimeout, l)
+	iop, err = InstallManifests(iop, iArgs.force, rootArgs.dryRun, restConfig, client, iArgs.readinessTimeout, l)
 	if err != nil {
 		return fmt.Errorf("failed to install manifests: %v", err)
 	}
@@ -184,30 +197,19 @@ func runApplyCmd(cmd *cobra.Command, rootArgs *rootArgs, iArgs *installArgs, log
 	return nil
 }
 
-// InstallManifests generates manifests from the given input files and --set flag overlays and applies them to the
+// InstallManifests generates manifests from the given istiooperator instance and applies them to the
 // cluster. See GenManifests for more description of the manifest generation process.
 //  force   validation warnings are written to logger but command is not aborted
 //  dryRun  all operations are done but nothing is written
 // Returns final IstioOperator after installation if successful.
-func InstallManifests(setOverlay []string, inFilenames []string, force bool, dryRun bool,
-	kubeConfigPath string, context string, waitTimeout time.Duration, l clog.Logger) (*v1alpha12.IstioOperator, error) {
-
-	restConfig, clientset, client, err := K8sConfig(kubeConfigPath, context)
-	if err != nil {
-		return nil, err
-	}
-	if err := k8sversion.IsK8VersionSupported(clientset, l); err != nil {
-		return nil, err
-	}
-	_, iop, err := manifest.GenerateConfig(inFilenames, setOverlay, force, restConfig, l)
-	if err != nil {
-		return nil, err
-	}
-
+func InstallManifests(iop *v1alpha12.IstioOperator, force bool, dryRun bool, restConfig *rest.Config, client client.Client,
+	waitTimeout time.Duration, l clog.Logger) (*v1alpha12.IstioOperator, error) {
 	// Needed in case we are running a test through this path that doesn't start a new process.
 	cache.FlushObjectCaches()
-	opts := &helmreconciler.Options{DryRun: dryRun, Log: l, WaitTimeout: waitTimeout, ProgressLog: progress.NewLog(),
-		Force: force}
+	opts := &helmreconciler.Options{
+		DryRun: dryRun, Log: l, WaitTimeout: waitTimeout, ProgressLog: progress.NewLog(),
+		Force: force,
+	}
 	reconciler, err := helmreconciler.NewHelmReconciler(client, restConfig, iop, opts)
 	if err != nil {
 		return iop, err
@@ -249,7 +251,7 @@ func savedIOPName(iop *v1alpha12.IstioOperator) string {
 
 // DetectIstioVersionDiff will show warning if istioctl version and control plane version are different
 // nolint: interfacer
-func DetectIstioVersionDiff(cmd *cobra.Command, tag string, ns string, kubeClient kube.ExtendedClient, iArgs *installArgs) error {
+func DetectIstioVersionDiff(cmd *cobra.Command, tag string, ns string, kubeClient kube.ExtendedClient, setFlags []string) error {
 	icps, err := kubeClient.GetIstioVersions(context.TODO(), ns)
 	if err != nil {
 		return err
@@ -273,15 +275,26 @@ func DetectIstioVersionDiff(cmd *cobra.Command, tag string, ns string, kubeClien
 				icpTag = val
 			}
 		}
+		revision := manifest.GetValueForSetFlag(setFlags, "revision")
+		msg := ""
 		// when the revision is not passed and if the ns has a prior istio
-		if iArgs.revision == "" && tag != icpTag {
+		if revision == "" && tag != icpTag {
+			if icpTag < tag {
+				msg = "A newer"
+			} else {
+				msg = "An older"
+			}
 			cmd.Printf("! Istio control planes installed: %s.\n"+
-				"! An older installed version of Istio has been detected. Running this command will overwrite it.\n", strings.Join(icpTags, ", "))
+				"! "+msg+" installed version of Istio has been detected. Running this command will overwrite it.\n", strings.Join(icpTags, ", "))
 		}
 		// when the revision is passed
-		if icpTag != "" && tag != icpTag && iArgs.revision != "" {
-			cmd.Printf("! Istio is being upgraded from %s -> %s.\n"+
-				"! Before upgrading, you may wish to use 'istioctl analyze' to check for IST0002 deprecation warnings.\n", icpTag, tag)
+		if icpTag != "" && tag != icpTag && revision != "" {
+			if icpTag > tag {
+				cmd.Printf("! Istio is being upgraded from %s -> %s.\n"+
+					"! Before upgrading, you may wish to use 'istioctl analyze' to check for IST0002 and IST0135 deprecation warnings.\n", icpTag, tag)
+			} else {
+				cmd.Printf("! Istio is being downgraded from %s -> %s.", icpTag, tag)
+			}
 		}
 	}
 	return nil
@@ -299,18 +312,9 @@ func GetTagVersion(tagInfo string) (string, error) {
 	return tag.String(), nil
 }
 
-// GetProfileNSAndEnabledComponents get the profile and all the enabled components
+// getProfileNSAndEnabledComponents get the profile and all the enabled components
 // from the given input files and --set flag overlays.
-func getProfileNSAndEnabledComponents(setOverlay []string, inFilenames []string, force bool, l clog.Logger) (string, string, []string, error) {
-	overlayYAML, profile, err := manifest.ReadYamlProfile(inFilenames, setOverlay, force, l)
-	if err != nil {
-		return "", "", nil, fmt.Errorf("failed to read profile: %v", err)
-	}
-	_, iop, err := manifest.GenIOPFromProfile(profile, overlayYAML, setOverlay, force, false, nil, l)
-	if err != nil {
-		return "", "", nil, fmt.Errorf("failed to generate IOP from profile %s: %v", profile, err)
-	}
-
+func getProfileNSAndEnabledComponents(iop *v1alpha12.IstioOperator) (string, string, []string, error) {
 	var enabledComponents []string
 	if iop.Spec.Components != nil {
 		for _, c := range name.AllCoreComponentNames {
@@ -323,23 +327,21 @@ func getProfileNSAndEnabledComponents(setOverlay []string, inFilenames []string,
 			}
 		}
 		for _, c := range iop.Spec.Components.IngressGateways {
-			if c.Enabled.Value {
+			if c.Enabled.GetValue() {
 				enabledComponents = append(enabledComponents, name.UserFacingComponentName(name.IngressComponentName))
 				break
 			}
 		}
 		for _, c := range iop.Spec.Components.EgressGateways {
-			if c.Enabled.Value {
+			if c.Enabled.GetValue() {
 				enabledComponents = append(enabledComponents, name.UserFacingComponentName(name.EgressComponentName))
 				break
 			}
 		}
 	}
 
-	configuredNamespace := v1alpha12.Namespace(iop.Spec)
-	if configuredNamespace == "" {
-		return profile, controller.IstioNamespace, enabledComponents, nil
+	if configuredNamespace := v1alpha12.Namespace(iop.Spec); configuredNamespace != "" {
+		return iop.Spec.Profile, configuredNamespace, enabledComponents, nil
 	}
-
-	return profile, v1alpha12.Namespace(iop.Spec), enabledComponents, nil
+	return iop.Spec.Profile, name.IstioDefaultNamespace, enabledComponents, nil
 }

@@ -33,9 +33,7 @@ import (
 	"istio.io/istio/pkg/test/framework/resource"
 )
 
-var (
-	inst istio.Instance
-)
+var inst istio.Instance
 
 const (
 	PilotCertsPath  = "tests/testdata/certs/pilot"
@@ -59,9 +57,6 @@ func TestMain(m *testing.M) {
 		NewSuite(m).
 		Label(label.CustomSetup).
 		RequireSingleCluster().
-
-		// SDS requires Kubernetes 1.13
-		RequireEnvironmentVersion("1.13").
 		Label("CustomSetup").
 		Setup(istio.Setup(&inst, setupConfig, CreateCustomIstiodSecret)).
 		Run()
@@ -164,11 +159,6 @@ meshConfig:
 values:
   global:
     pilotCertProvider: "mycopki"
-    logging:
-      level: "default:debug"
-    proxy:
-      logLevel: debug
-      componentLogLevel: "misc:debug"
   pilot:
     env:
       # We need to turn off the XDS Auth because test certificates only have a fixed/hardcoded identity, but the identity of the actual 
@@ -178,6 +168,7 @@ values:
       #    no identities ([spiffe://cluster.local/ns/mounted-certs/sa/client client.mounted-certs.svc]) matched istio-fd-sds-1-4523/default
       XDS_AUTH: "false"
 `
+	cfg.DeployEastWestGW = false
 }
 
 func CreateCustomIstiodSecret(ctx resource.Context) error {

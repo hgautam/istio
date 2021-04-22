@@ -28,14 +28,15 @@ import (
 	extauthztcp "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/ext_authz/v3"
 	envoy_type_matcher_v3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	envoytypev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+	"github.com/gogo/protobuf/types"
 	"github.com/golang/protobuf/ptypes/duration"
 	"github.com/hashicorp/go-multierror"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
-	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/extensionproviders"
 	"istio.io/istio/pilot/pkg/networking/plugin"
 	authzmodel "istio.io/istio/pilot/pkg/security/authz/model"
-	"istio.io/istio/pkg/config/host"
+	"istio.io/istio/pkg/util/gogo"
 )
 
 const (
@@ -66,16 +67,13 @@ var (
 type builtExtAuthz struct {
 	http *extauthzhttp.ExtAuthz
 	tcp  *extauthztcp.ExtAuthz
+	err  error
 }
 
-func processExtensionProvider(in *plugin.InputParams) (map[string]*builtExtAuthz, error) {
-	var errs error
-	configs := in.Push.Mesh.ExtensionProviders
-	if len(configs) == 0 {
-		errs = multierror.Append(errs, fmt.Errorf("at least 1 extension provider must be defined"))
-	}
+func processExtensionProvider(in *plugin.InputParams) map[string]*builtExtAuthz {
 	resolved := map[string]*builtExtAuthz{}
-	for i, config := range configs {
+	for i, config := range in.Push.Mesh.ExtensionProviders {
+		var errs error
 		if config.Name == "" {
 			errs = multierror.Append(errs, fmt.Errorf("extension provider name must not be empty, found empty at index: %d", i))
 		} else if _, found := resolved[config.Name]; found {
@@ -90,21 +88,22 @@ func processExtensionProvider(in *plugin.InputParams) (map[string]*builtExtAuthz
 		case *meshconfig.MeshConfig_ExtensionProvider_EnvoyExtAuthzGrpc:
 			parsed, err = buildExtAuthzGRPC(in, p.EnvoyExtAuthzGrpc)
 		default:
-			err = fmt.Errorf("unsupported extension provider: %s", config.Name)
+			continue
 		}
 		if err != nil {
 			errs = multierror.Append(errs, multierror.Prefix(err, fmt.Sprintf("failed to parse extension provider %q:", config.Name)))
 		}
+		if parsed == nil {
+			parsed = &builtExtAuthz{}
+		}
+		parsed.err = errs
 		resolved[config.Name] = parsed
-	}
-	if errs != nil {
-		return nil, errs
 	}
 
 	if authzLog.DebugEnabled() {
 		authzLog.Debugf("Resolved extension providers: %v", spew.Sdump(resolved))
 	}
-	return resolved, nil
+	return resolved
 }
 
 func notAllTheSame(names []string) bool {
@@ -127,7 +126,6 @@ func getExtAuthz(resolved map[string]*builtExtAuthz, providers []string) (*built
 		return nil, fmt.Errorf("only 1 provider can be used per workload, found multiple providers: %v", providers)
 	}
 
-	var errs error
 	provider := providers[0]
 	ret, found := resolved[provider]
 	if !found {
@@ -135,10 +133,9 @@ func getExtAuthz(resolved map[string]*builtExtAuthz, providers []string) (*built
 		for p := range resolved {
 			li = append(li, p)
 		}
-		errs = multierror.Append(fmt.Errorf("available providers are %v but found %q", li, provider))
-	}
-	if errs != nil {
-		return nil, errs
+		return nil, fmt.Errorf("available providers are %v but found %q", li, provider)
+	} else if ret.err != nil {
+		return nil, fmt.Errorf("found errors in provider %s: %v", provider, ret.err)
 	}
 
 	return ret, nil
@@ -150,7 +147,7 @@ func buildExtAuthzHTTP(in *plugin.InputParams, config *meshconfig.MeshConfig_Ext
 	if err != nil {
 		errs = multierror.Append(errs, err)
 	}
-	hostname, cluster, err := parseService(in, config.Service, port)
+	hostname, cluster, err := extensionproviders.LookupCluster(in.Push, config.Service, port)
 	if err != nil {
 		errs = multierror.Append(errs, err)
 	}
@@ -166,6 +163,18 @@ func buildExtAuthzHTTP(in *plugin.InputParams, config *meshconfig.MeshConfig_Ext
 			errs = multierror.Append(errs, fmt.Errorf("pathPrefix must begin with `/`, found: %q", config.PathPrefix))
 		}
 	}
+	checkWildcard := func(field string, values []string) {
+		for _, val := range values {
+			if val == "*" {
+				errs = multierror.Append(errs, fmt.Errorf("a single wildcard (\"*\") is not supported, change it to either prefix or suffix match: %s", field))
+			}
+		}
+	}
+	checkWildcard("IncludeRequestHeadersInCheck", config.IncludeRequestHeadersInCheck)
+	checkWildcard("IncludeHeadersInCheck", config.IncludeHeadersInCheck)
+	checkWildcard("HeadersToDownstreamOnDeny", config.HeadersToDownstreamOnDeny)
+	checkWildcard("HeadersToUpstreamOnAllow", config.HeadersToUpstreamOnAllow)
+
 	if errs != nil {
 		return nil, errs
 	}
@@ -179,7 +188,7 @@ func buildExtAuthzGRPC(in *plugin.InputParams, config *meshconfig.MeshConfig_Ext
 	if err != nil {
 		errs = multierror.Append(errs, err)
 	}
-	_, cluster, err := parseService(in, config.Service, port)
+	_, cluster, err := extensionproviders.LookupCluster(in.Push, config.Service, port)
 	if err != nil {
 		errs = multierror.Append(errs, err)
 	}
@@ -191,44 +200,7 @@ func buildExtAuthzGRPC(in *plugin.InputParams, config *meshconfig.MeshConfig_Ext
 		return nil, errs
 	}
 
-	return generateGRPCConfig(cluster, config.FailOpen, status), nil
-}
-
-func parseService(in *plugin.InputParams, service string, port int) (hostname string, cluster string, err error) {
-	if service == "" {
-		err = fmt.Errorf("service must not be empty")
-		return
-	}
-
-	// TODO(yangminzhu): Verify the service and its cluster is supported, e.g. resolution type is not OriginalDst.
-	if parts := strings.Split(service, "/"); len(parts) == 2 {
-		namespace, name := parts[0], parts[1]
-		if svc := in.Push.ServiceIndex.HostnameAndNamespace[host.Name(name)][namespace]; svc != nil {
-			hostname = string(svc.Hostname)
-			cluster = model.BuildSubsetKey(model.TrafficDirectionOutbound, "", svc.Hostname, port)
-			return
-		}
-	} else {
-		namespaceToServices := in.Push.ServiceIndex.HostnameAndNamespace[host.Name(service)]
-		var namespaces []string
-		for k := range namespaceToServices {
-			namespaces = append(namespaces, k)
-		}
-		// If namespace is omitted, return successfully if there is only one such host name in the service index.
-		if len(namespaces) == 1 {
-			svc := namespaceToServices[namespaces[0]]
-			hostname = string(svc.Hostname)
-			cluster = model.BuildSubsetKey(model.TrafficDirectionOutbound, "", svc.Hostname, port)
-			return
-		} else if len(namespaces) > 1 {
-			err = fmt.Errorf("found %s in multiple namespaces %v, specify the namespace explicitly in "+
-				"the format of <Namespace>/<Hostname>", service, namespaces)
-			return
-		}
-	}
-
-	err = fmt.Errorf("could not find service %s in Istio service registry", service)
-	return
+	return generateGRPCConfig(cluster, config, status), nil
 }
 
 func parsePort(port uint32) (int, error) {
@@ -257,10 +229,8 @@ func generateHTTPConfig(hostname, cluster string, status *envoytypev3.HttpStatus
 	service := &extauthzhttp.HttpService{
 		PathPrefix: config.PathPrefix,
 		ServerUri: &envoy_config_core_v3.HttpUri{
-			// Timeout is required. Use a large value as a placeholder and so that the timeout in DestinationRule (should
-			// be much smaller) can be used to control the real timeout.
-			// TODO(yangminzhu): Revisit the default and investigate if we need to expose it in the MeshConfig.
-			Timeout: &duration.Duration{Seconds: 600},
+			// Timeout is required.
+			Timeout: timeoutOrDefault(config.Timeout),
 			// Uri is required but actually not used in the ext_authz filter.
 			Uri: fmt.Sprintf("http://%s", hostname),
 			HttpUpstreamType: &envoy_config_core_v3.HttpUri_Cluster{
@@ -268,11 +238,31 @@ func generateHTTPConfig(hostname, cluster string, status *envoytypev3.HttpStatus
 			},
 		},
 	}
-	if headers := generateHeaders(config.IncludeHeadersInCheck); headers != nil {
+	allowedHeaders := generateHeaders(config.IncludeRequestHeadersInCheck)
+	if allowedHeaders == nil {
+		// IncludeHeadersInCheck is deprecated, only use it if IncludeRequestHeadersInCheck is not set.
+		// TODO: Remove the IncludeHeadersInCheck field before promoting to beta.
+		allowedHeaders = generateHeaders(config.IncludeHeadersInCheck)
+	}
+	var headersToAdd []*envoy_config_core_v3.HeaderValue
+	var additionalHeaders []string
+	for k := range config.IncludeAdditionalHeadersInCheck {
+		additionalHeaders = append(additionalHeaders, k)
+	}
+	sort.Strings(additionalHeaders)
+	for _, k := range additionalHeaders {
+		headersToAdd = append(headersToAdd, &envoy_config_core_v3.HeaderValue{
+			Key:   k,
+			Value: config.IncludeAdditionalHeadersInCheck[k],
+		})
+	}
+	if allowedHeaders != nil || len(headersToAdd) != 0 {
 		service.AuthorizationRequest = &extauthzhttp.AuthorizationRequest{
-			AllowedHeaders: headers,
+			AllowedHeaders: allowedHeaders,
+			HeadersToAdd:   headersToAdd,
 		}
 	}
+
 	if len(config.HeadersToUpstreamOnAllow) > 0 || len(config.HeadersToDownstreamOnDeny) > 0 {
 		service.AuthorizationResponse = &extauthzhttp.AuthorizationResponse{
 			AllowedUpstreamHeaders: generateHeaders(config.HeadersToUpstreamOnAllow),
@@ -287,11 +277,13 @@ func generateHTTPConfig(hostname, cluster string, status *envoytypev3.HttpStatus
 			HttpService: service,
 		},
 		FilterEnabledMetadata: generateFilterMatcher(authzmodel.RBACHTTPFilterName),
+		WithRequestBody:       withBodyRequest(config.IncludeRequestBodyInCheck),
 	}
 	return &builtExtAuthz{http: http}
 }
 
-func generateGRPCConfig(cluster string, failOpen bool, status *envoytypev3.HttpStatus) *builtExtAuthz {
+func generateGRPCConfig(cluster string, config *meshconfig.MeshConfig_ExtensionProvider_EnvoyExternalAuthorizationGrpcProvider,
+	status *envoytypev3.HttpStatus) *builtExtAuthz {
 	// The cluster includes the character `|` that is invalid in gRPC authority header and will cause the connection
 	// rejected in the server side, replace it with a valid character and set in authority otherwise ext_authz will
 	// use the cluster name as default authority.
@@ -303,18 +295,21 @@ func generateGRPCConfig(cluster string, failOpen bool, status *envoytypev3.HttpS
 				Authority:   authority,
 			},
 		},
+		Timeout: timeoutOrDefault(config.Timeout),
 	}
 	http := &extauthzhttp.ExtAuthz{
 		StatusOnError:    status,
-		FailureModeAllow: failOpen,
+		FailureModeAllow: config.FailOpen,
 		Services: &extauthzhttp.ExtAuthz_GrpcService{
 			GrpcService: grpc,
 		},
 		FilterEnabledMetadata: generateFilterMatcher(authzmodel.RBACHTTPFilterName),
+		TransportApiVersion:   envoy_config_core_v3.ApiVersion_V3,
+		WithRequestBody:       withBodyRequest(config.IncludeRequestBodyInCheck),
 	}
 	tcp := &extauthztcp.ExtAuthz{
 		StatPrefix:            "tcp.",
-		FailureModeAllow:      failOpen,
+		FailureModeAllow:      config.FailOpen,
 		TransportApiVersion:   envoy_config_core_v3.ApiVersion_V3,
 		GrpcService:           grpc,
 		FilterEnabledMetadata: generateFilterMatcher(authzmodel.RBACTCPFilterName),
@@ -328,11 +323,27 @@ func generateHeaders(headers []string) *envoy_type_matcher_v3.ListStringMatcher 
 	}
 	var patterns []*envoy_type_matcher_v3.StringMatcher
 	for _, header := range headers {
-		patterns = append(patterns, &envoy_type_matcher_v3.StringMatcher{
-			MatchPattern: &envoy_type_matcher_v3.StringMatcher_Exact{
-				Exact: header,
-			},
-		})
+		var pattern *envoy_type_matcher_v3.StringMatcher
+		if strings.HasPrefix(header, "*") {
+			pattern = &envoy_type_matcher_v3.StringMatcher{
+				MatchPattern: &envoy_type_matcher_v3.StringMatcher_Suffix{
+					Suffix: strings.TrimPrefix(header, "*"),
+				},
+			}
+		} else if strings.HasSuffix(header, "*") {
+			pattern = &envoy_type_matcher_v3.StringMatcher{
+				MatchPattern: &envoy_type_matcher_v3.StringMatcher_Prefix{
+					Prefix: strings.TrimSuffix(header, "*"),
+				},
+			}
+		} else {
+			pattern = &envoy_type_matcher_v3.StringMatcher{
+				MatchPattern: &envoy_type_matcher_v3.StringMatcher_Exact{
+					Exact: header,
+				},
+			}
+		}
+		patterns = append(patterns, pattern)
 	}
 	return &envoy_type_matcher_v3.ListStringMatcher{Patterns: patterns}
 }
@@ -343,7 +354,7 @@ func generateFilterMatcher(name string) *envoy_type_matcher_v3.MetadataMatcher {
 		Path: []*envoy_type_matcher_v3.MetadataMatcher_PathSegment{
 			{
 				Segment: &envoy_type_matcher_v3.MetadataMatcher_PathSegment_Key{
-					Key: "shadow_effective_policy_id",
+					Key: authzmodel.RBACExtAuthzShadowRulesStatPrefix + authzmodel.RBACShadowEffectivePolicyID,
 				},
 			},
 		},
@@ -356,5 +367,24 @@ func generateFilterMatcher(name string) *envoy_type_matcher_v3.MetadataMatcher {
 				},
 			},
 		},
+	}
+}
+
+func timeoutOrDefault(t *types.Duration) *duration.Duration {
+	if t == nil {
+		// Default timeout is 600s.
+		return &duration.Duration{Seconds: 600}
+	}
+	return gogo.DurationToProtoDuration(t)
+}
+
+func withBodyRequest(config *meshconfig.MeshConfig_ExtensionProvider_EnvoyExternalAuthorizationRequestBody) *extauthzhttp.BufferSettings {
+	if config == nil {
+		return nil
+	}
+	return &extauthzhttp.BufferSettings{
+		MaxRequestBytes:     config.MaxRequestBytes,
+		AllowPartialMessage: config.AllowPartialMessage,
+		PackAsBytes:         config.PackAsBytes,
 	}
 }

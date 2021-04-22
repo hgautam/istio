@@ -26,6 +26,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/go-multierror"
@@ -65,9 +66,12 @@ import (
 	"k8s.io/kubectl/pkg/cmd/apply"
 	kubectlDelete "k8s.io/kubectl/pkg/cmd/delete"
 	"k8s.io/kubectl/pkg/cmd/util"
-	serviceapisclient "sigs.k8s.io/service-apis/pkg/client/clientset/versioned"
-	serviceapisfake "sigs.k8s.io/service-apis/pkg/client/clientset/versioned/fake"
-	serviceapisinformer "sigs.k8s.io/service-apis/pkg/client/informers/externalversions"
+	gatewayapiclient "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
+	gatewayapifake "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned/fake"
+	gatewayapiinformer "sigs.k8s.io/gateway-api/pkg/client/informers/externalversions"
+	mcsapisClient "sigs.k8s.io/mcs-api/pkg/client/clientset/versioned"
+	mcsapisfake "sigs.k8s.io/mcs-api/pkg/client/clientset/versioned/fake"
+	mcsapisInformer "sigs.k8s.io/mcs-api/pkg/client/informers/externalversions"
 
 	"istio.io/api/label"
 	istioclient "istio.io/client-go/pkg/clientset/versioned"
@@ -88,7 +92,6 @@ const (
 // informers. Sharing informers is especially important for load on the API server/Istiod itself.
 type Client interface {
 	// TODO - stop embedding this, it will conflict with future additions. Use Kube() instead is preferred
-	// TODO - add istio/client-go and service-apis
 	kubernetes.Interface
 	// RESTConfig returns the Kubernetes rest.Config used to configure the clients.
 	RESTConfig() *rest.Config
@@ -108,8 +111,11 @@ type Client interface {
 	// Istio returns the Istio kube client.
 	Istio() istioclient.Interface
 
-	// ServiceApis returns the service-apis kube client.
-	ServiceApis() serviceapisclient.Interface
+	// GatewayApi returns the gateway-api kube client.
+	GatewayAPI() gatewayapiclient.Interface
+
+	// MCSApis returns the mcs-apis kube client.
+	MCSApis() mcsapisClient.Interface
 
 	// KubeInformer returns an informer for core kube client
 	KubeInformer() informers.SharedInformerFactory
@@ -123,12 +129,18 @@ type Client interface {
 	// IstioInformer returns an informer for the istio client
 	IstioInformer() istioinformer.SharedInformerFactory
 
-	// ServiceApisInformer returns an informer for the service-apis client
-	ServiceApisInformer() serviceapisinformer.SharedInformerFactory
+	// GatewayApiInformer returns an informer for the gateway-api client
+	GatewayAPIInformer() gatewayapiinformer.SharedInformerFactory
+
+	// MCSApisInformer returns an informer for the mcs-apis client
+	MCSApisInformer() mcsapisInformer.SharedInformerFactory
 
 	// RunAndWait starts all informers and waits for their caches to sync.
 	// Warning: this must be called AFTER .Informer() is called, which will register the informer.
 	RunAndWait(stop <-chan struct{})
+
+	// GetKubernetesVersion returns the Kubernetes server version
+	GetKubernetesVersion() (*kubeVersion.Info, error)
 }
 
 // ExtendedClient is an extended client with additional helpers/functionality for Istioctl and testing.
@@ -136,9 +148,6 @@ type ExtendedClient interface {
 	Client
 	// Revision of the Istio control plane.
 	Revision() string
-
-	// GetKubernetesVersion returns the Kubernetes server version
-	GetKubernetesVersion() (*kubeVersion.Info, error)
 
 	// EnvoyDo makes an http request to the Envoy in the specified pod.
 	EnvoyDo(ctx context.Context, podName, podNamespace, method, path string, body []byte) ([]byte, error)
@@ -185,8 +194,10 @@ type ExtendedClient interface {
 	UtilFactory() util.Factory
 }
 
-var _ Client = &client{}
-var _ ExtendedClient = &client{}
+var (
+	_ Client         = &client{}
+	_ ExtendedClient = &client{}
+)
 
 const resyncInterval = 0
 
@@ -207,16 +218,23 @@ func NewFakeClient(objects ...runtime.Object) ExtendedClient {
 
 	c.metadata = metadatafake.NewSimpleMetadataClient(s)
 	c.metadataInformer = metadatainformer.NewSharedInformerFactory(c.metadata, resyncInterval)
-
-	c.dynamic = dynamicfake.NewSimpleDynamicClient(s)
+	// Support some galley tests using basicmetadata
+	// If you are adding something to this list, consider other options like adding to the scheme.
+	gvrToListKind := map[schema.GroupVersionResource]string{
+		{Group: "testdata.istio.io", Version: "v1alpha1", Resource: "Kind1s"}: "Kind1List",
+	}
+	c.dynamic = dynamicfake.NewSimpleDynamicClientWithCustomListKinds(s, gvrToListKind)
 	c.dynamicInformer = dynamicinformer.NewDynamicSharedInformerFactory(c.dynamic, resyncInterval)
 
 	istioFake := istiofake.NewSimpleClientset()
 	c.istio = istioFake
 	c.istioInformer = istioinformer.NewSharedInformerFactoryWithOptions(c.istio, resyncInterval)
 
-	c.serviceapis = serviceapisfake.NewSimpleClientset()
-	c.serviceapisInformers = serviceapisinformer.NewSharedInformerFactory(c.serviceapis, resyncInterval)
+	c.gatewayapi = gatewayapifake.NewSimpleClientset()
+	c.gatewayapiInformer = gatewayapiinformer.NewSharedInformerFactory(c.gatewayapi, resyncInterval)
+
+	c.mcsapis = mcsapisfake.NewSimpleClientset()
+	c.mcsapisInformers = mcsapisInformer.NewSharedInformerFactory(c.mcsapis, resyncInterval)
 
 	c.extSet = extfake.NewSimpleClientset()
 
@@ -260,8 +278,7 @@ type client struct {
 	clientFactory util.Factory
 	config        *rest.Config
 
-	extSet        kubeExtClient.Interface
-	versionClient discovery.ServerVersionInterface
+	extSet kubeExtClient.Interface
 
 	kube         kubernetes.Interface
 	kubeInformer informers.SharedInformerFactory
@@ -275,8 +292,11 @@ type client struct {
 	istio         istioclient.Interface
 	istioInformer istioinformer.SharedInformerFactory
 
-	serviceapis          serviceapisclient.Interface
-	serviceapisInformers serviceapisinformer.SharedInformerFactory
+	gatewayapi         gatewayapiclient.Interface
+	gatewayapiInformer gatewayapiinformer.SharedInformerFactory
+
+	mcsapis          mcsapisClient.Interface
+	mcsapisInformers mcsapisInformer.SharedInformerFactory
 
 	// If enable, will wait for cache syncs with extremely short delay. This should be used only for tests
 	fastSync               bool
@@ -287,6 +307,10 @@ type client struct {
 	restClient      *rest.RESTClient
 	discoveryClient discovery.CachedDiscoveryInterface
 	mapper          meta.RESTMapper
+
+	versionOnce sync.Once
+	version     *kubeVersion.Info
+	versionErr  error
 }
 
 // newClientInternal creates a Kubernetes client from the given factory.
@@ -339,18 +363,23 @@ func newClientInternal(clientFactory util.Factory, revision string) (*client, er
 	}
 	c.istioInformer = istioinformer.NewSharedInformerFactory(c.istio, resyncInterval)
 
-	c.serviceapis, err = serviceapisclient.NewForConfig(c.config)
+	c.gatewayapi, err = gatewayapiclient.NewForConfig(c.config)
 	if err != nil {
 		return nil, err
 	}
-	c.serviceapisInformers = serviceapisinformer.NewSharedInformerFactory(c.serviceapis, resyncInterval)
+	c.gatewayapiInformer = gatewayapiinformer.NewSharedInformerFactory(c.gatewayapi, resyncInterval)
+
+	c.mcsapis, err = mcsapisClient.NewForConfig(c.config)
+	if err != nil {
+		return nil, err
+	}
+	c.mcsapisInformers = mcsapisInformer.NewSharedInformerFactory(c.mcsapis, resyncInterval)
 
 	ext, err := kubeExtClient.NewForConfig(c.config)
 	if err != nil {
 		return nil, err
 	}
 	c.extSet = ext
-	c.versionClient = ext
 
 	return &c, nil
 }
@@ -391,8 +420,12 @@ func (c *client) Istio() istioclient.Interface {
 	return c.istio
 }
 
-func (c *client) ServiceApis() serviceapisclient.Interface {
-	return c.serviceapis
+func (c *client) GatewayAPI() gatewayapiclient.Interface {
+	return c.gatewayapi
+}
+
+func (c *client) MCSApis() mcsapisClient.Interface {
+	return c.mcsapis
 }
 
 func (c *client) KubeInformer() informers.SharedInformerFactory {
@@ -411,8 +444,12 @@ func (c *client) IstioInformer() istioinformer.SharedInformerFactory {
 	return c.istioInformer
 }
 
-func (c *client) ServiceApisInformer() serviceapisinformer.SharedInformerFactory {
-	return c.serviceapisInformers
+func (c *client) GatewayAPIInformer() gatewayapiinformer.SharedInformerFactory {
+	return c.gatewayapiInformer
+}
+
+func (c *client) MCSApisInformer() mcsapisInformer.SharedInformerFactory {
+	return c.mcsapisInformers
 }
 
 // RunAndWait starts all informers and waits for their caches to sync.
@@ -422,7 +459,7 @@ func (c *client) RunAndWait(stop <-chan struct{}) {
 	c.dynamicInformer.Start(stop)
 	c.metadataInformer.Start(stop)
 	c.istioInformer.Start(stop)
-	c.serviceapisInformers.Start(stop)
+	c.gatewayapiInformer.Start(stop)
 	if c.fastSync {
 		// WaitForCacheSync will virtually never be synced on the first call, as its called immediately after Start()
 		// This triggers a 100ms delay per call, which is often called 2-3 times in a test, delaying tests.
@@ -431,7 +468,7 @@ func (c *client) RunAndWait(stop <-chan struct{}) {
 		fastWaitForCacheSyncDynamic(c.dynamicInformer)
 		fastWaitForCacheSyncDynamic(c.metadataInformer)
 		fastWaitForCacheSync(c.istioInformer)
-		fastWaitForCacheSync(c.serviceapisInformers)
+		fastWaitForCacheSync(c.gatewayapiInformer)
 		_ = wait.PollImmediate(time.Microsecond, wait.ForeverTestTimeout, func() (bool, error) {
 			if c.informerWatchesPending.Load() == 0 {
 				return true, nil
@@ -443,8 +480,17 @@ func (c *client) RunAndWait(stop <-chan struct{}) {
 		c.dynamicInformer.WaitForCacheSync(stop)
 		c.metadataInformer.WaitForCacheSync(stop)
 		c.istioInformer.WaitForCacheSync(stop)
-		c.serviceapisInformers.WaitForCacheSync(stop)
+		c.gatewayapiInformer.WaitForCacheSync(stop)
 	}
+}
+
+func (c *client) GetKubernetesVersion() (*kubeVersion.Info, error) {
+	c.versionOnce.Do(func() {
+		v, err := c.Discovery().ServerVersion()
+		c.version = v
+		c.versionErr = err
+	})
+	return c.version, c.versionErr
 }
 
 type reflectInformerSync interface {
@@ -500,10 +546,6 @@ func WaitForCacheSyncInterval(stopCh <-chan struct{}, interval time.Duration, ca
 
 func (c *client) Revision() string {
 	return c.revision
-}
-
-func (c *client) GetKubernetesVersion() (*kubeVersion.Info, error) {
-	return c.versionClient.ServerVersion()
 }
 
 func (c *client) PodExec(podName, podNamespace, container string, command string) (stdout, stderr string, err error) {
@@ -650,9 +692,9 @@ func (c *client) GetIstioPods(ctx context.Context, namespace string, params map[
 	if c.revision != "" {
 		labelSelector, ok := params["labelSelector"]
 		if ok {
-			params["labelSelector"] = fmt.Sprintf("%s,%s=%s", labelSelector, label.IstioRev, c.revision)
+			params["labelSelector"] = fmt.Sprintf("%s,%s=%s", labelSelector, label.IoIstioRev.Name, c.revision)
 		} else {
-			params["labelSelector"] = fmt.Sprintf("%s=%s", label.IstioRev, c.revision)
+			params["labelSelector"] = fmt.Sprintf("%s=%s", label.IoIstioRev.Name, c.revision)
 		}
 	}
 
@@ -740,7 +782,6 @@ func (c *client) GetIstioVersions(ctx context.Context, namespace string) (*versi
 }
 
 func (c *client) getIstioVersionUsingExec(pod *v1.Pod) (*version.BuildInfo, error) {
-
 	// exclude data plane components from control plane list
 	labelToPodDetail := map[string]struct {
 		binary    string
@@ -816,7 +857,7 @@ func (c *client) ApplyYAMLFilesDryRun(namespace string, yamlFiles ...string) err
 
 func (c *client) CreatePerRPCCredentials(ctx context.Context, tokenNamespace, tokenServiceAccount string, audiences []string,
 	expirationSeconds int64) (credentials.PerRPCCredentials, error) {
-	return NewRPCCredentials(c, tokenNamespace, tokenServiceAccount, audiences, expirationSeconds)
+	return NewRPCCredentials(c, tokenNamespace, tokenServiceAccount, audiences, expirationSeconds, 60)
 }
 
 func (c *client) UtilFactory() util.Factory {
@@ -914,15 +955,15 @@ func (c *client) deleteFile(namespace string, dryRun bool, file string) error {
 	}
 
 	opts := kubectlDelete.DeleteOptions{
-		FilenameOptions:  fileOpts,
-		Cascade:          true,
-		GracePeriod:      -1,
-		IgnoreNotFound:   true,
-		WaitForDeletion:  true,
-		WarnClusterScope: enforceNamespace,
-		DynamicClient:    c.dynamic,
-		DryRunVerifier:   resource.NewDryRunVerifier(c.dynamic, c.discoveryClient),
-		IOStreams:        streams,
+		FilenameOptions:   fileOpts,
+		CascadingStrategy: metav1.DeletePropagationBackground,
+		GracePeriod:       -1,
+		IgnoreNotFound:    true,
+		WaitForDeletion:   true,
+		WarnClusterScope:  enforceNamespace,
+		DynamicClient:     c.dynamic,
+		DryRunVerifier:    resource.NewDryRunVerifier(c.dynamic, c.discoveryClient),
+		IOStreams:         streams,
 	}
 	if dryRun {
 		opts.DryRunStrategy = util.DryRunServer

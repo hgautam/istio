@@ -34,6 +34,7 @@ import (
 	structpb "github.com/golang/protobuf/ptypes/struct"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
+	"istio.io/istio/pilot/pkg/trustbundle"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/labels"
@@ -43,8 +44,10 @@ import (
 	"istio.io/pkg/monitoring"
 )
 
-var _ mesh.Holder = &Environment{}
-var _ mesh.NetworksHolder = &Environment{}
+var (
+	_ mesh.Holder         = &Environment{}
+	_ mesh.NetworksHolder = &Environment{}
+)
 
 // Environment provides an aggregate environmental API for Pilot
 type Environment struct {
@@ -76,13 +79,11 @@ type Environment struct {
 	DomainSuffix string
 
 	ledger ledger.Ledger
-}
 
-func (e *Environment) GetDomainSuffix() string {
-	if len(e.DomainSuffix) > 0 {
-		return e.DomainSuffix
-	}
-	return constants.DefaultKubernetesDomain
+	// TrustBundle: List of Mesh TrustAnchors
+	TrustBundle *trustbundle.TrustBundle
+
+	clusterLocalServices ClusterLocalProvider
 }
 
 func (e *Environment) Mesh() *meshconfig.MeshConfig {
@@ -140,6 +141,21 @@ func (e *Environment) Version() string {
 	return ""
 }
 
+// Init initializes the Environment for use.
+func (e *Environment) Init() {
+	// Use a default DomainSuffix, if none was provided.
+	if len(e.DomainSuffix) == 0 {
+		e.DomainSuffix = constants.DefaultKubernetesDomain
+	}
+
+	// Create the cluster-local service registry.
+	e.clusterLocalServices = NewClusterLocalProvider(e)
+}
+
+func (e *Environment) ClusterLocal() ClusterLocalProvider {
+	return e.clusterLocalServices
+}
+
 func (e *Environment) GetLedger() ledger.Ledger {
 	return e.ledger
 }
@@ -159,8 +175,10 @@ type XdsUpdates = map[ConfigKey]struct{}
 // with a Proxy, the default (a networking.core.ConfigGenerator instance) will be used.
 // The server may associate a different generator based on client metadata. Different
 // WatchedResources may use same or different Generator.
+// Note: any errors returned will completely close the XDS stream. Use with caution; typically and empty
+// or no response is preferred.
 type XdsResourceGenerator interface {
-	Generate(proxy *Proxy, push *PushContext, w *WatchedResource, updates *PushRequest) Resources
+	Generate(proxy *Proxy, push *PushContext, w *WatchedResource, updates *PushRequest) (Resources, error)
 }
 
 // Proxy contains information about an specific instance of a proxy (envoy sidecar, gateway,
@@ -290,9 +308,7 @@ type WatchedResource struct {
 	LastRequest *discovery.DiscoveryRequest
 }
 
-var (
-	istioVersionRegexp = regexp.MustCompile(`^([1-9]+)\.([0-9]+)(\.([0-9]+))?`)
-)
+var istioVersionRegexp = regexp.MustCompile(`^([1-9]+)\.([0-9]+)(\.([0-9]+))?`)
 
 // StringList is a list that will be marshaled to a comma separate string in Json
 type StringList []string
@@ -397,6 +413,18 @@ func (s *NodeMetaProxyConfig) UnmarshalJSON(data []byte) error {
 	return gogojsonpb.Unmarshal(bytes.NewReader(data), pc)
 }
 
+// Node is a typed version of Envoy node with metadata.
+type Node struct {
+	// ID of the Envoy node
+	ID string
+	// Metadata is the typed node metadata
+	Metadata *BootstrapNodeMetadata
+	// RawMetadata is the untyped node metadata
+	RawMetadata map[string]interface{}
+	// Locality from Envoy bootstrap
+	Locality *core.Locality
+}
+
 // BootstrapNodeMetadata is a superset of NodeMetadata, intended to model the entirety of the node metadata
 // we configure in the Envoy bootstrap. This is split out from NodeMetadata to explicitly segment the parameters
 // that are consumed by Pilot from the parameters used only as part of the bootstrap. Fields used by bootstrap only
@@ -415,17 +443,20 @@ type BootstrapNodeMetadata struct {
 	// of the workload instance (ex: k8s deployment for a k8s pod).
 	Owner string `json:"OWNER,omitempty"`
 
-	// PlatformMetadata contains any platform specific metadata
-	PlatformMetadata map[string]string `json:"PLATFORM_METADATA,omitempty"`
+	// ProxyViaAgent specifies whether xDS streams are proxied through the agent.
+	ProxyViaAgent bool `json:"PROXY_VIA_AGENT,omitempty"`
 
-	StatsInclusionPrefixes string `json:"sidecar.istio.io/statsInclusionPrefixes,omitempty"`
-	StatsInclusionRegexps  string `json:"sidecar.istio.io/statsInclusionRegexps,omitempty"`
-	StatsInclusionSuffixes string `json:"sidecar.istio.io/statsInclusionSuffixes,omitempty"`
-	ExtraStatTags          string `json:"sidecar.istio.io/extraStatTags,omitempty"`
+	// PilotSAN is the list of subject alternate names for the xDS server.
+	PilotSubjectAltName []string `json:"PILOT_SAN,omitempty"`
 
-	// StsPort specifies the port of security token exchange server (STS).
-	// Used by envoy filters
-	StsPort string `json:"STS_PORT,omitempty"`
+	// OutlierLogPath is the cluster manager outlier event log path.
+	OutlierLogPath string `json:"OUTLIER_LOG_PATH,omitempty"`
+
+	// PilotCertProvider is the provider of the xDS server DNS certificate.
+	PilotCertProvider string `json:"PILOT_CERT_PROVIDER,omitempty"`
+
+	// ProvCertDir is the directory containing pre-provisioned certs.
+	ProvCert string `json:"PROV_CERT,omitempty"`
 }
 
 // NodeMetadata defines the metadata associated with a proxy
@@ -445,6 +476,9 @@ type NodeMetadata struct {
 
 	// Labels specifies the set of workload instance (ex: k8s pod) labels associated with this node.
 	Labels map[string]string `json:"LABELS,omitempty"`
+
+	// Labels specifies the set of workload instance (ex: k8s pod) annotations associated with this node.
+	Annotations map[string]string `json:"ANNOTATIONS,omitempty"`
 
 	// InstanceIPs is the set of IPs attached to this proxy
 	InstanceIPs StringList `json:"INSTANCE_IPS,omitempty"`
@@ -470,7 +504,7 @@ type NodeMetadata struct {
 	ClusterID string `json:"CLUSTER_ID,omitempty"`
 
 	// Network defines the network the node belongs to. It is an optional metadata,
-	// set at injection time. When set, the Endpoints returned to a note and not on same network
+	// set at injection time. When set, the Endpoints returned to a node and not on same network
 	// will be replaced with the gateway defined in the settings.
 	Network string `json:"NETWORK,omitempty"`
 
@@ -520,6 +554,13 @@ type NodeMetadata struct {
 
 	// UnprivilegedPod is used to determine whether a Gateway Pod can open ports < 1024
 	UnprivilegedPod string `json:"UNPRIVILEGED_POD,omitempty"`
+
+	// PlatformMetadata contains any platform specific metadata
+	PlatformMetadata map[string]string `json:"PLATFORM_METADATA,omitempty"`
+
+	// StsPort specifies the port of security token exchange server (STS).
+	// Used by envoy filters
+	StsPort string `json:"STS_PORT,omitempty"`
 
 	// Contains a copy of the raw metadata. This is needed to lookup arbitrary values.
 	// If a value is known ahead of time it should be added to the struct rather than reading from here,
@@ -577,9 +618,7 @@ type IstioVersion struct {
 	Patch int
 }
 
-var (
-	MaxIstioVersion = &IstioVersion{Major: 65535, Minor: 65535, Patch: 65535}
-)
+var MaxIstioVersion = &IstioVersion{Major: 65535, Minor: 65535, Patch: 65535}
 
 // Compare returns -1/0/1 if version is less than, equal or greater than inv
 // To compare only on major, call this function with { X, -1, -1}.
@@ -627,6 +666,8 @@ const (
 	Router NodeType = "router"
 )
 
+var NodeTypes = [...]NodeType{SidecarProxy, Router}
+
 // IsApplicationNodeType verifies that the NodeType is one of the declared constants in the model
 func IsApplicationNodeType(nType NodeType) bool {
 	switch nType {
@@ -646,7 +687,6 @@ func (node *Proxy) ServiceNode() string {
 	return strings.Join([]string{
 		string(node.Type), ip, node.ID, node.DNSDomain,
 	}, serviceNodeSeparator)
-
 }
 
 // RouterMode decides the behavior of Istio Gateway (normal or sni-dnat)
@@ -807,18 +847,18 @@ func ParseMetadata(metadata *structpb.Struct) (*NodeMetadata, error) {
 
 // ParseServiceNodeWithMetadata parse the Envoy Node from the string generated by ServiceNode
 // function and the metadata.
-func ParseServiceNodeWithMetadata(s string, metadata *NodeMetadata) (*Proxy, error) {
-	parts := strings.Split(s, serviceNodeSeparator)
+func ParseServiceNodeWithMetadata(nodeID string, metadata *NodeMetadata) (*Proxy, error) {
+	parts := strings.Split(nodeID, serviceNodeSeparator)
 	out := &Proxy{
 		Metadata: metadata,
 	}
 
 	if len(parts) != 4 {
-		return out, fmt.Errorf("missing parts in the service node %q", s)
+		return out, fmt.Errorf("missing parts in the service node %q", nodeID)
 	}
 
 	if !IsApplicationNodeType(NodeType(parts[0])) {
-		return out, fmt.Errorf("invalid node type (valid types: sidecar, router in the service node %q", s)
+		return out, fmt.Errorf("invalid node type (valid types: sidecar, router in the service node %q", nodeID)
 	}
 	out.Type = NodeType(parts[0])
 

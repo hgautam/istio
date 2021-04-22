@@ -26,7 +26,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ghodss/yaml"
 	"gomodules.xyz/jsonpatch/v3"
 	kubeApiAdmissionv1 "k8s.io/api/admission/v1"
 	kubeApiAdmissionv1beta1 "k8s.io/api/admission/v1beta1"
@@ -38,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 
 	"istio.io/api/annotation"
+	"istio.io/api/label"
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	opconfig "istio.io/istio/operator/pkg/apis/istio/v1alpha1"
 	"istio.io/istio/pilot/cmd/pilot-agent/status"
@@ -76,12 +76,8 @@ type Webhook struct {
 	meshConfig   *meshconfig.MeshConfig
 	valuesConfig string
 
-	healthCheckInterval time.Duration
-	healthCheckFile     string
-
 	watcher Watcher
 
-	mon      *monitor
 	env      *model.Environment
 	revision string
 }
@@ -129,19 +125,6 @@ type WebhookParameters struct {
 	// This is mainly used for tests. Webhook runs on the port started by Istiod.
 	Port int
 
-	// MonitoringPort is the webhook port, e.g. typically 15014.
-	// Set to -1 to disable monitoring
-	MonitoringPort int
-
-	// HealthCheckInterval configures how frequently the health check
-	// file is updated. Value of zero disables the health check
-	// update.
-	HealthCheckInterval time.Duration
-
-	// HealthCheckFile specifies the path to the health check file
-	// that is periodically updated.
-	HealthCheckFile string
-
 	Env *model.Environment
 
 	// Use an existing mux instead of creating our own.
@@ -158,12 +141,10 @@ func NewWebhook(p WebhookParameters) (*Webhook, error) {
 	}
 
 	wh := &Webhook{
-		watcher:             p.Watcher,
-		meshConfig:          p.Env.Mesh(),
-		healthCheckInterval: p.HealthCheckInterval,
-		healthCheckFile:     p.HealthCheckFile,
-		env:                 p.Env,
-		revision:            p.Revision,
+		watcher:    p.Watcher,
+		meshConfig: p.Env.Mesh(),
+		env:        p.Env,
+		revision:   p.Revision,
 	}
 
 	p.Watcher.SetHandler(wh.updateConfig)
@@ -182,43 +163,12 @@ func NewWebhook(p WebhookParameters) (*Webhook, error) {
 		wh.mu.Unlock()
 	})
 
-	if p.MonitoringPort >= 0 {
-		mon, err := startMonitor(p.Mux, p.MonitoringPort)
-		if err != nil {
-			return nil, fmt.Errorf("could not start monitoring server %v", err)
-		}
-		wh.mon = mon
-	}
-
 	return wh, nil
 }
 
 // Run implements the webhook server
 func (wh *Webhook) Run(stop <-chan struct{}) {
 	go wh.watcher.Run(stop)
-
-	if wh.mon != nil {
-		defer wh.mon.monitoringServer.Close()
-	}
-
-	var healthC <-chan time.Time
-	if wh.healthCheckInterval != 0 && wh.healthCheckFile != "" {
-		t := time.NewTicker(wh.healthCheckInterval)
-		healthC = t.C
-		defer t.Stop()
-	}
-
-	for {
-		select {
-		case <-healthC:
-			content := []byte(`ok`)
-			if err := ioutil.WriteFile(wh.healthCheckFile, content, 0644); err != nil {
-				log.Errorf("Health check update of %q failed: %v", wh.healthCheckFile, err)
-			}
-		case <-stop:
-			return
-		}
-	}
 }
 
 func (wh *Webhook) updateConfig(sidecarConfig *Config, valuesConfig string) {
@@ -325,7 +275,9 @@ type InjectionParameters struct {
 	pod                 *corev1.Pod
 	deployMeta          *metav1.ObjectMeta
 	typeMeta            *metav1.TypeMeta
-	template            Templates
+	templates           Templates
+	defaultTemplate     []string
+	aliases             map[string][]string
 	meshConfig          *meshconfig.MeshConfig
 	valuesConfig        string
 	revision            string
@@ -423,6 +375,12 @@ func injectPod(req InjectionParameters) ([]byte, error) {
 // TODO move this to api repo
 const OverrideAnnotation = "proxy.istio.io/overrides"
 
+// TemplatesAnnotation declares the set of templates to use for injection. If not specified, DefaultTemplates
+// will take precedence, which will inject a standard sidecar.
+// The format is a comma separated list. For example, `inject.istio.io/templates: sidecar,debug`.
+// TODO move this to api repo
+const TemplatesAnnotation = "inject.istio.io/templates"
+
 // reapplyOverwrittenContainers enables users to provide container level overrides for settings in the injection template
 // * originalPod: the pod before injection. If needed, we will apply some configurations from this pod on top of the final pod
 // * templatePod: the rendered injection template. This is needed only to see what containers we injected
@@ -503,6 +461,44 @@ func reapplyOverwrittenContainers(finalPod *corev1.Pod, originalPod *corev1.Pod,
 	return finalPod, nil
 }
 
+// reinsertOverrides applies the containers listed in OverrideAnnotation to a pod. This is to achieve
+// idempotency by handling an edge case where an injection template is modifying a container already
+// present in the pod spec. In these cases, the logic to strip injected containers would remove the
+// original injected parts as well, leading to the templating logic being different (for example,
+// reading the .Spec.Containers field would be empty).
+func reinsertOverrides(pod *corev1.Pod) (*corev1.Pod, error) {
+	type podOverrides struct {
+		Containers     []corev1.Container `json:"containers,omitempty"`
+		InitContainers []corev1.Container `json:"initContainers,omitempty"`
+	}
+
+	existingOverrides := podOverrides{}
+	if annotationOverrides, f := pod.Annotations[OverrideAnnotation]; f {
+		if err := json.Unmarshal([]byte(annotationOverrides), &existingOverrides); err != nil {
+			return nil, err
+		}
+	}
+
+	pod = pod.DeepCopy()
+	for _, c := range existingOverrides.Containers {
+		match := FindContainer(c.Name, pod.Spec.Containers)
+		if match != nil {
+			continue
+		}
+		pod.Spec.Containers = append(pod.Spec.Containers, c)
+	}
+
+	for _, c := range existingOverrides.InitContainers {
+		match := FindContainer(c.Name, pod.Spec.InitContainers)
+		if match != nil {
+			continue
+		}
+		pod.Spec.InitContainers = append(pod.Spec.InitContainers, c)
+	}
+
+	return pod, nil
+}
+
 func createPatch(pod *corev1.Pod, original []byte) ([]byte, error) {
 	reinjected, err := json.Marshal(pod)
 	if err != nil {
@@ -545,6 +541,9 @@ func postProcessPod(pod *corev1.Pod, injectedPod corev1.Pod, req InjectionParame
 }
 
 func applyMetadata(pod *corev1.Pod, injectedPodData corev1.Pod, req InjectionParameters) {
+	if nw, ok := req.proxyEnvs["ISTIO_META_NETWORK"]; ok {
+		pod.Labels[label.TopologyNetwork.Name] = nw
+	}
 	// Add all additional injected annotations. These are overridden if needed
 	pod.Annotations[annotation.SidecarStatus.Name] = getInjectionStatus(injectedPodData.Spec)
 
@@ -556,12 +555,8 @@ func applyMetadata(pod *corev1.Pod, injectedPodData corev1.Pod, req InjectionPar
 
 // reorderPod ensures containers are properly ordered after merging
 func reorderPod(pod *corev1.Pod, req InjectionParameters) error {
-	var (
-		merr error
-	)
-	mc := &meshconfig.MeshConfig{
-		DefaultConfig: &meshconfig.ProxyConfig{},
-	}
+	var merr error
+	mc := req.meshConfig
 	// Get copy of pod proxyconfig, to determine container ordering
 	if pca, f := req.pod.ObjectMeta.GetAnnotations()[annotation.ProxyConfig.Name]; f {
 		mc, merr = mesh.ApplyProxyConfig(pca, *req.meshConfig)
@@ -575,7 +570,7 @@ func reorderPod(pod *corev1.Pod, req InjectionParameters) error {
 		return fmt.Errorf("could not parse configuration values: %v", err)
 	}
 	// nolint: staticcheck
-	holdPod := mc.DefaultConfig.HoldApplicationUntilProxyStarts.GetValue() ||
+	holdPod := mc.GetDefaultConfig().GetHoldApplicationUntilProxyStarts().GetValue() ||
 		valuesStruct.GetGlobal().GetProxy().GetHoldApplicationUntilProxyStarts().GetValue()
 
 	proxyLocation := MoveLast
@@ -708,43 +703,6 @@ func applyOverlay(target *corev1.Pod, overlayJSON []byte) (*corev1.Pod, error) {
 	return &pod, nil
 }
 
-func mergeInjectedConfigLegacy(req *corev1.Pod, injected []byte) (*corev1.Pod, error) {
-	current, err := json.Marshal(req.Spec)
-	if err != nil {
-		return nil, err
-	}
-
-	// The template is yaml, StrategicMergePatch expects JSON
-	injectedJSON, err := yaml.YAMLToJSON(injected)
-	if err != nil {
-		return nil, fmt.Errorf("yaml to json: %v", err)
-	}
-
-	podSpec := corev1.PodSpec{}
-	// Overlay the injected template onto the original podSpec
-	patched, err := strategicpatch.StrategicMergePatch(current, injectedJSON, podSpec)
-	if err != nil {
-		return nil, fmt.Errorf("strategic merge: %v", err)
-	}
-	if err := json.Unmarshal(patched, &podSpec); err != nil {
-		return nil, fmt.Errorf("unmarshal patched pod: %v", err)
-	}
-	pod := req.DeepCopy()
-	pod.Spec = podSpec
-
-	return pod, nil
-}
-
-func mergeInjectedConfig(req *corev1.Pod, injected []byte) (*corev1.Pod, error) {
-	// The template is yaml, StrategicMergePatch expects JSON
-	injectedJSON, err := yaml.YAMLToJSON(injected)
-	if err != nil {
-		return nil, fmt.Errorf("yaml to json: %v", err)
-	}
-
-	return applyOverlay(req, injectedJSON)
-}
-
 func (wh *Webhook) inject(ar *kube.AdmissionReview, path string) *kube.AdmissionResponse {
 	req := ar.Request
 	var pod corev1.Pod
@@ -778,7 +736,9 @@ func (wh *Webhook) inject(ar *kube.AdmissionReview, path string) *kube.Admission
 		pod:                 &pod,
 		deployMeta:          deploy,
 		typeMeta:            typeMeta,
-		template:            wh.Config.Templates,
+		templates:           wh.Config.Templates,
+		defaultTemplate:     wh.Config.DefaultTemplates,
+		aliases:             wh.Config.Aliases,
 		meshConfig:          wh.meshConfig,
 		valuesConfig:        wh.valuesConfig,
 		revision:            wh.revision,
@@ -873,14 +833,40 @@ func (wh *Webhook) serveInject(w http.ResponseWriter, r *http.Request) {
 }
 
 // parseInjectEnvs parse new envs from inject url path
-// follow format: /inject/k1/v1/k2/v2, any kv order works
-// eg. "/inject/cluster/cluster1", "/inject/net/network1/cluster/cluster1"
+// follow format: /inject/k1/v1/k2/v2 when values do not contain slashes,
+// follow format: /inject/:ENV:net=network1:ENV:cluster=cluster1:ENV:rootpage=/foo/bar
+// when values contain slashes.
 func parseInjectEnvs(path string) map[string]string {
 	path = strings.TrimSuffix(path, "/")
-	res := strings.Split(path, "/")
+	res := func(path string) []string {
+		parts := strings.SplitN(path, "/", 3)
+		// The 3rd part has to start with separator :ENV:
+		// If not, this inject path is considered using slash as separator
+		// If length is less than 3, then the path is simply "/inject",
+		// process just like before :ENV: separator is introduced.
+		var newRes []string
+		if len(parts) == 3 {
+			if strings.HasPrefix(parts[2], ":ENV:") {
+				pairs := strings.Split(parts[2], ":ENV:")
+				for i := 1; i < len(pairs); i++ { // skip the first part, it is a nil
+					pair := strings.SplitN(pairs[i], "=", 2)
+					// The first part is the variable name which can not be empty
+					// the second part is the variable value which can be empty but has to exist
+					// for example, aaa=bbb, aaa= are valid, but =aaa or = are not valid, the
+					// invalid ones will be ignored.
+					if len(pair[0]) > 0 && len(pair) == 2 {
+						newRes = append(newRes, pair...)
+					}
+				}
+				return newRes
+			}
+			return strings.Split(parts[2], "/")
+		}
+		return newRes
+	}(path)
 	newEnvs := make(map[string]string)
 
-	for i := 2; i < len(res); i += 2 { // skip '/inject'
+	for i := 0; i < len(res); i += 2 {
 		k := res[i]
 		if i == len(res)-1 { // ignore the last key without value
 			log.Warnf("Odd number of inject env entries, ignore the last key %s\n", k)

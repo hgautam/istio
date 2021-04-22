@@ -24,7 +24,6 @@ import (
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/apigen"
 	"istio.io/istio/pilot/pkg/xds"
-	v2 "istio.io/istio/pilot/pkg/xds/v2"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	"istio.io/istio/pkg/adsc"
 	"istio.io/istio/pkg/config/schema/collections"
@@ -39,7 +38,7 @@ var (
 // Creates an in-process discovery server, using the same code as Istiod, but
 // backed by an in-memory config and endpoint store.
 func initDS() *xds.SimpleServer {
-	ds := xds.NewXDS()
+	ds := xds.NewXDS(make(chan struct{}))
 
 	sd := ds.DiscoveryServer.MemRegistry
 	sd.AddHTTPService("fortio1.fortio.svc.cluster.local", "10.10.10.1", 8081)
@@ -59,7 +58,7 @@ func TestAPIGen(t *testing.T) {
 	ds := initDS()
 	ds.DiscoveryServer.Generators["api"] = &apigen.APIGenerator{}
 	epGen := &xds.EdsGenerator{Server: ds.DiscoveryServer}
-	ds.DiscoveryServer.Generators["api/"+v2.EndpointType] = epGen
+	ds.DiscoveryServer.Generators["api/"+v3.EndpointType] = epGen
 
 	err := ds.StartGRPC(grpcAddr)
 	if err != nil {
@@ -106,6 +105,5 @@ func TestAPIGen(t *testing.T) {
 		for _, se := range sec {
 			t.Log(se)
 		}
-
 	})
 }

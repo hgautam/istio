@@ -31,10 +31,10 @@ import (
 	"github.com/gogo/protobuf/types"
 	"github.com/golang/protobuf/jsonpb"
 	"github.com/golang/protobuf/proto"
-	"github.com/golang/protobuf/ptypes"
 	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/protobuf/testing/protocmp"
+	"google.golang.org/protobuf/types/known/anypb"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
@@ -51,14 +51,12 @@ import (
 	"istio.io/istio/pkg/test/env"
 )
 
-var (
-	testMesh = meshconfig.MeshConfig{
-		ConnectTimeout: &types.Duration{
-			Seconds: 10,
-			Nanos:   1,
-		},
-	}
-)
+var testMesh = meshconfig.MeshConfig{
+	ConnectTimeout: &types.Duration{
+		Seconds: 10,
+		Nanos:   1,
+	},
+}
 
 func buildEnvoyFilterConfigStore(configPatches []*networking.EnvoyFilter_EnvoyConfigObjectPatch) model.IstioConfigStore {
 	store := model.MakeIstioStore(memory.Make(collections.Pilot))
@@ -93,6 +91,7 @@ func newTestEnvironment(serviceDiscovery model.ServiceDiscovery, meshConfig mesh
 	}
 
 	e.PushContext = model.NewPushContext()
+	e.Init()
 	_ = e.PushContext.InitContext(e, nil, nil)
 
 	return e
@@ -434,13 +433,34 @@ func TestApplyListenerPatches(t *testing.T) {
 			Patch: &networking.EnvoyFilter_Patch{
 				Operation: networking.EnvoyFilter_Patch_MERGE,
 				Value: buildPatchStruct(`
-{"name": "envoy.filters.network.http_connection_manager", 
+{"name": "envoy.http_connection_manager", 
  "typed_config": {
         "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
          "mergeSlashes": true,
          "alwaysSetRequestIdInResponse": true
  }
 }`),
+			},
+		},
+		{
+			ApplyTo: networking.EnvoyFilter_HTTP_FILTER,
+			Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
+				Context: networking.EnvoyFilter_SIDECAR_INBOUND,
+				ObjectTypes: &networking.EnvoyFilter_EnvoyConfigObjectMatch_Listener{
+					Listener: &networking.EnvoyFilter_ListenerMatch{
+						PortNumber: 80,
+						FilterChain: &networking.EnvoyFilter_ListenerMatch_FilterChainMatch{
+							Filter: &networking.EnvoyFilter_ListenerMatch_FilterMatch{
+								Name:      "envoy.http_connection_manager", // Use deprecated name for test.
+								SubFilter: &networking.EnvoyFilter_ListenerMatch_SubFilterMatch{Name: "http-filter2"},
+							},
+						},
+					},
+				},
+			},
+			Patch: &networking.EnvoyFilter_Patch{
+				Operation: networking.EnvoyFilter_Patch_INSERT_AFTER,
+				Value:     buildPatchStruct(`{"name": "http-filter-5"}`),
 			},
 		},
 		{
@@ -575,6 +595,83 @@ func TestApplyListenerPatches(t *testing.T) {
 				Value:     buildPatchStruct(`{"name": "http-filter-replaced-should-not-be-applied"}`),
 			},
 		},
+		{
+			ApplyTo: networking.EnvoyFilter_NETWORK_FILTER,
+			Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
+				ObjectTypes: &networking.EnvoyFilter_EnvoyConfigObjectMatch_Listener{
+					Listener: &networking.EnvoyFilter_ListenerMatch{
+						Name: VirtualInboundListenerName,
+						FilterChain: &networking.EnvoyFilter_ListenerMatch_FilterChainMatch{
+							DestinationPort: 6380,
+							Filter: &networking.EnvoyFilter_ListenerMatch_FilterMatch{
+								Name: "network-filter-to-be-replaced",
+							},
+						},
+					},
+				},
+			},
+			Patch: &networking.EnvoyFilter_Patch{
+				Operation: networking.EnvoyFilter_Patch_REPLACE,
+				Value: buildPatchStruct(`
+{"name": "envoy.redis_proxy",
+ "typed_config": {
+        "@type": "type.googleapis.com/envoy.extensions.filters.network.redis_proxy.v3.RedisProxy",
+         "stat_prefix": "redis_stats",
+         "prefix_routes": {
+             "catch_all_route": {
+                 "cluster": "custom-redis-cluster"
+             }
+         }
+ }
+}`),
+			},
+		},
+		{
+			ApplyTo: networking.EnvoyFilter_FILTER_CHAIN,
+			Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
+				Context: networking.EnvoyFilter_SIDECAR_OUTBOUND,
+				ObjectTypes: &networking.EnvoyFilter_EnvoyConfigObjectMatch_Listener{
+					Listener: &networking.EnvoyFilter_ListenerMatch{
+						FilterChain: &networking.EnvoyFilter_ListenerMatch_FilterChainMatch{
+							Filter: &networking.EnvoyFilter_ListenerMatch_FilterMatch{
+								Name: "envoy.transport_sockets.tls",
+							},
+						},
+					},
+				},
+			},
+			Patch: &networking.EnvoyFilter_Patch{
+				Operation: networking.EnvoyFilter_Patch_MERGE,
+				Value: buildPatchStruct(`
+					{"transport_socket":{
+						"name":"envoy.transport_sockets.tls",
+						"typed_config":{
+							"@type":"type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+							"common_tls_context":{
+								"tls_params":{
+									"tls_maximum_protocol_version":"TLSv1_3",
+									"tls_minimum_protocol_version":"TLSv1_2"}}}}}`),
+			},
+		},
+		{
+			ApplyTo: networking.EnvoyFilter_NETWORK_FILTER,
+			Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
+				ObjectTypes: &networking.EnvoyFilter_EnvoyConfigObjectMatch_Listener{
+					Listener: &networking.EnvoyFilter_ListenerMatch{
+						Name: VirtualInboundListenerName,
+						FilterChain: &networking.EnvoyFilter_ListenerMatch_FilterChainMatch{
+							Name: "filter-chain-name-match",
+							Filter: &networking.EnvoyFilter_ListenerMatch_FilterMatch{
+								Name: "custom-network-filter-2",
+							},
+						},
+					},
+				},
+			},
+			Patch: &networking.EnvoyFilter_Patch{
+				Operation: networking.EnvoyFilter_Patch_REMOVE,
+			},
+		},
 	}
 
 	sidecarOutboundIn := []*listener.Listener{
@@ -590,6 +687,23 @@ func TestApplyListenerPatches(t *testing.T) {
 				},
 			},
 			FilterChains: []*listener.FilterChain{
+				{
+					FilterChainMatch: &listener.FilterChainMatch{TransportProtocol: "tls"},
+					TransportSocket: &core.TransportSocket{
+						Name: "envoy.transport_sockets.tls",
+						ConfigType: &core.TransportSocket_TypedConfig{
+							TypedConfig: util.MessageToAny(&tls.DownstreamTlsContext{
+								CommonTlsContext: &tls.CommonTlsContext{
+									TlsParams: &tls.TlsParameters{
+										EcdhCurves:                []string{"X25519"},
+										TlsMaximumProtocolVersion: tls.TlsParameters_TLSv1_1,
+									},
+								},
+							}),
+						},
+					},
+					Filters: []*listener.Filter{{Name: "envoy.transport_sockets.tls"}},
+				},
 				{
 					Filters: []*listener.Filter{
 						{Name: "filter1"},
@@ -731,6 +845,24 @@ func TestApplyListenerPatches(t *testing.T) {
 			},
 			FilterChains: []*listener.FilterChain{
 				{
+					FilterChainMatch: &listener.FilterChainMatch{TransportProtocol: "tls"},
+					TransportSocket: &core.TransportSocket{
+						Name: "envoy.transport_sockets.tls",
+						ConfigType: &core.TransportSocket_TypedConfig{
+							TypedConfig: util.MessageToAny(&tls.DownstreamTlsContext{
+								CommonTlsContext: &tls.CommonTlsContext{
+									TlsParams: &tls.TlsParameters{
+										EcdhCurves:                []string{"X25519"},
+										TlsMaximumProtocolVersion: tls.TlsParameters_TLSv1_3,
+										TlsMinimumProtocolVersion: tls.TlsParameters_TLSv1_2,
+									},
+								},
+							}),
+						},
+					},
+					Filters: []*listener.Filter{{Name: "envoy.transport_sockets.tls"}},
+				},
+				{
 					Filters: []*listener.Filter{
 						{Name: "filter0"},
 						{Name: "filter1"},
@@ -752,7 +884,8 @@ func TestApplyListenerPatches(t *testing.T) {
 			FilterChains: []*listener.FilterChain{
 				{
 					Filters: []*listener.Filter{
-						{Name: "envoy.redis_proxy",
+						{
+							Name: "envoy.redis_proxy",
 							ConfigType: &listener.Filter_TypedConfig{
 								TypedConfig: util.MessageToAny(&redis_proxy.RedisProxy{
 									StatPrefix: "redis_stats",
@@ -884,6 +1017,16 @@ func TestApplyListenerPatches(t *testing.T) {
 			},
 			FilterChains: []*listener.FilterChain{
 				{
+					FilterChainMatch: &listener.FilterChainMatch{TransportProtocol: "tls"},
+					TransportSocket: &core.TransportSocket{
+						Name: "envoy.transport_sockets.tls",
+						ConfigType: &core.TransportSocket_TypedConfig{
+							TypedConfig: util.MessageToAny(&tls.DownstreamTlsContext{}),
+						},
+					},
+					Filters: []*listener.Filter{{Name: "envoy.transport_sockets.tls"}},
+				},
+				{
 					Filters: []*listener.Filter{
 						{Name: "filter1"},
 						{Name: "filter2"},
@@ -910,6 +1053,23 @@ func TestApplyListenerPatches(t *testing.T) {
 			},
 			FilterChains: []*listener.FilterChain{
 				{
+					FilterChainMatch: &listener.FilterChainMatch{TransportProtocol: "tls"},
+					TransportSocket: &core.TransportSocket{
+						Name: "envoy.transport_sockets.tls",
+						ConfigType: &core.TransportSocket_TypedConfig{
+							TypedConfig: util.MessageToAny(&tls.DownstreamTlsContext{
+								CommonTlsContext: &tls.CommonTlsContext{
+									TlsParams: &tls.TlsParameters{
+										TlsMaximumProtocolVersion: tls.TlsParameters_TLSv1_3,
+										TlsMinimumProtocolVersion: tls.TlsParameters_TLSv1_2,
+									},
+								},
+							}),
+						},
+					},
+					Filters: []*listener.Filter{{Name: "envoy.transport_sockets.tls"}},
+				},
+				{
 					Filters: []*listener.Filter{
 						{Name: "filter0"},
 						{Name: "filter1"},
@@ -925,108 +1085,12 @@ func TestApplyListenerPatches(t *testing.T) {
 	faultFilterIn := &fault.HTTPFault{
 		UpstreamCluster: "foobar",
 	}
-	faultFilterInAny, _ := ptypes.MarshalAny(faultFilterIn)
+	faultFilterInAny, _ := anypb.New(faultFilterIn)
 	faultFilterOut := &fault.HTTPFault{
 		UpstreamCluster: "scooby",
 		DownstreamNodes: []string{"foo"},
 	}
-	faultFilterOutAny, _ := ptypes.MarshalAny(faultFilterOut)
-	sidecarInboundIn := []*listener.Listener{
-		{
-			Name: "12345",
-			Address: &core.Address{
-				Address: &core.Address_SocketAddress{
-					SocketAddress: &core.SocketAddress{
-						PortSpecifier: &core.SocketAddress_PortValue{
-							PortValue: 12345,
-						},
-					},
-				},
-			},
-		},
-		{
-			Name: "another-listener",
-			Address: &core.Address{
-				Address: &core.Address_SocketAddress{
-					SocketAddress: &core.SocketAddress{
-						PortSpecifier: &core.SocketAddress_PortValue{
-							PortValue: 80,
-						},
-					},
-				},
-			},
-			ListenerFilters: []*listener.ListenerFilter{{Name: "envoy.tls_inspector"}},
-			FilterChains: []*listener.FilterChain{
-				{
-					FilterChainMatch: &listener.FilterChainMatch{TransportProtocol: "tls"},
-					TransportSocket: &core.TransportSocket{
-						Name: "envoy.transport_sockets.tls",
-						ConfigType: &core.TransportSocket_TypedConfig{
-							TypedConfig: util.MessageToAny(&tls.DownstreamTlsContext{}),
-						},
-					},
-					Filters: []*listener.Filter{{Name: "network-filter"}},
-				},
-				{
-					Filters: []*listener.Filter{
-						{
-							Name: wellknown.HTTPConnectionManager,
-							ConfigType: &listener.Filter_TypedConfig{
-								TypedConfig: util.MessageToAny(&http_conn.HttpConnectionManager{
-									HttpFilters: []*http_conn.HttpFilter{
-										{Name: wellknown.Fault,
-											ConfigType: &http_conn.HttpFilter_TypedConfig{TypedConfig: faultFilterInAny},
-										},
-										{Name: "http-filter2"},
-									},
-								}),
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	sidecarInboundOut := []*listener.Listener{
-		{
-			Name: "another-listener",
-			Address: &core.Address{
-				Address: &core.Address_SocketAddress{
-					SocketAddress: &core.SocketAddress{
-						PortSpecifier: &core.SocketAddress_PortValue{
-							PortValue: 80,
-						},
-					},
-				},
-			},
-			ListenerFilters: []*listener.ListenerFilter{{Name: "envoy.tls_inspector"}},
-			FilterChains: []*listener.FilterChain{
-				{
-					Filters: []*listener.Filter{
-						{
-							Name: wellknown.HTTPConnectionManager,
-							ConfigType: &listener.Filter_TypedConfig{
-								TypedConfig: util.MessageToAny(&http_conn.HttpConnectionManager{
-									XffNumTrustedHops:            4,
-									MergeSlashes:                 true,
-									AlwaysSetRequestIdInResponse: true,
-									HttpFilters: []*http_conn.HttpFilter{
-										{Name: wellknown.Fault,
-											ConfigType: &http_conn.HttpFilter_TypedConfig{TypedConfig: faultFilterOutAny},
-										},
-										{Name: "http-filter3"},
-										{Name: "http-filter2"},
-										{Name: "http-filter4"},
-									},
-								}),
-							},
-						},
-					},
-				},
-			},
-		},
-	}
+	faultFilterOutAny, _ := anypb.New(faultFilterOut)
 
 	gatewayIn := []*listener.Listener{
 		{
@@ -1142,9 +1206,9 @@ func TestApplyListenerPatches(t *testing.T) {
 
 	sidecarVirtualInboundIn := []*listener.Listener{
 		{
-			Name:                                VirtualInboundListenerName,
-			HiddenEnvoyDeprecatedUseOriginalDst: istio_proto.BoolTrue,
-			TrafficDirection:                    core.TrafficDirection_INBOUND,
+			Name:             VirtualInboundListenerName,
+			UseOriginalDst:   istio_proto.BoolTrue,
+			TrafficDirection: core.TrafficDirection_INBOUND,
 			Address: &core.Address{
 				Address: &core.Address_SocketAddress{
 					SocketAddress: &core.SocketAddress{
@@ -1167,10 +1231,59 @@ func TestApplyListenerPatches(t *testing.T) {
 							ConfigType: &listener.Filter_TypedConfig{
 								TypedConfig: util.MessageToAny(&http_conn.HttpConnectionManager{
 									HttpFilters: []*http_conn.HttpFilter{
-										{Name: wellknown.Fault,
+										{
+											Name:       wellknown.Fault,
 											ConfigType: &http_conn.HttpFilter_TypedConfig{TypedConfig: faultFilterInAny},
 										},
 										{Name: "http-filter2"},
+									},
+								}),
+							},
+						},
+					},
+				},
+				{
+					FilterChainMatch: &listener.FilterChainMatch{
+						AddressSuffix: "0.0.0.0",
+					},
+					Filters: []*listener.Filter{
+						{Name: "network-filter-should-not-be-replaced"},
+					},
+				},
+				{
+					FilterChainMatch: &listener.FilterChainMatch{
+						DestinationPort: &wrappers.UInt32Value{
+							Value: 6380,
+						},
+					},
+					Filters: []*listener.Filter{
+						{Name: "network-filter-to-be-replaced"},
+					},
+				},
+				{
+					Name: "filter-chain-name-not-match",
+					Filters: []*listener.Filter{
+						{Name: "custom-network-filter-1"},
+						{Name: "custom-network-filter-2"},
+					},
+				},
+				{
+					Name: "filter-chain-name-match",
+					Filters: []*listener.Filter{
+						{Name: "custom-network-filter-1"},
+						{Name: "custom-network-filter-2"},
+					},
+				},
+				{
+					Name:             "catch-all",
+					FilterChainMatch: &listener.FilterChainMatch{},
+					Filters: []*listener.Filter{
+						{
+							Name: wellknown.HTTPConnectionManager,
+							ConfigType: &listener.Filter_TypedConfig{
+								TypedConfig: util.MessageToAny(&http_conn.HttpConnectionManager{
+									HttpFilters: []*http_conn.HttpFilter{
+										{Name: "base"},
 									},
 								}),
 							},
@@ -1183,9 +1296,9 @@ func TestApplyListenerPatches(t *testing.T) {
 
 	sidecarVirtualInboundOut := []*listener.Listener{
 		{
-			Name:                                VirtualInboundListenerName,
-			HiddenEnvoyDeprecatedUseOriginalDst: istio_proto.BoolTrue,
-			TrafficDirection:                    core.TrafficDirection_INBOUND,
+			Name:             VirtualInboundListenerName,
+			UseOriginalDst:   istio_proto.BoolTrue,
+			TrafficDirection: core.TrafficDirection_INBOUND,
 			Address: &core.Address{
 				Address: &core.Address_SocketAddress{
 					SocketAddress: &core.SocketAddress{
@@ -1211,12 +1324,74 @@ func TestApplyListenerPatches(t *testing.T) {
 									MergeSlashes:                 true,
 									AlwaysSetRequestIdInResponse: true,
 									HttpFilters: []*http_conn.HttpFilter{
-										{Name: wellknown.Fault,
+										{Name: "http-filter0"},
+										{
+											Name:       wellknown.Fault,
 											ConfigType: &http_conn.HttpFilter_TypedConfig{TypedConfig: faultFilterOutAny},
 										},
 										{Name: "http-filter3"},
 										{Name: "http-filter2"},
+										{Name: "http-filter-5"},
 										{Name: "http-filter4"},
+									},
+								}),
+							},
+						},
+					},
+				},
+				{
+					FilterChainMatch: &listener.FilterChainMatch{
+						AddressSuffix: "0.0.0.0",
+					},
+					Filters: []*listener.Filter{
+						{Name: "network-filter-should-not-be-replaced"},
+					},
+				},
+				{
+					FilterChainMatch: &listener.FilterChainMatch{
+						DestinationPort: &wrappers.UInt32Value{
+							Value: 6380,
+						},
+					},
+					Filters: []*listener.Filter{
+						{
+							Name: "envoy.redis_proxy",
+							ConfigType: &listener.Filter_TypedConfig{
+								TypedConfig: util.MessageToAny(&redis_proxy.RedisProxy{
+									StatPrefix: "redis_stats",
+									PrefixRoutes: &redis_proxy.RedisProxy_PrefixRoutes{
+										CatchAllRoute: &redis_proxy.RedisProxy_PrefixRoutes_Route{
+											Cluster: "custom-redis-cluster",
+										},
+									},
+								}),
+							},
+						},
+					},
+				},
+				{
+					Name: "filter-chain-name-not-match",
+					Filters: []*listener.Filter{
+						{Name: "custom-network-filter-1"},
+						{Name: "custom-network-filter-2"},
+					},
+				},
+				{
+					Name: "filter-chain-name-match",
+					Filters: []*listener.Filter{
+						{Name: "custom-network-filter-1"},
+					},
+				},
+				{
+					Name:             "catch-all",
+					FilterChainMatch: &listener.FilterChainMatch{},
+					Filters: []*listener.Filter{
+						{
+							Name: wellknown.HTTPConnectionManager,
+							ConfigType: &listener.Filter_TypedConfig{
+								TypedConfig: util.MessageToAny(&http_conn.HttpConnectionManager{
+									HttpFilters: []*http_conn.HttpFilter{
+										{Name: "base"},
 									},
 								}),
 							},
@@ -1267,17 +1442,6 @@ func TestApplyListenerPatches(t *testing.T) {
 		args args
 		want []*listener.Listener
 	}{
-		{
-			name: "sidecar inbound lds",
-			args: args{
-				patchContext: networking.EnvoyFilter_SIDECAR_INBOUND,
-				proxy:        sidecarProxy,
-				push:         push,
-				listeners:    sidecarInboundIn,
-				skipAdds:     false,
-			},
-			want: sidecarInboundOut,
-		},
 		{
 			name: "gateway lds",
 			args: args{

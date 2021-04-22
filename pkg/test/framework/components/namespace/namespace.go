@@ -35,6 +35,8 @@ type Config struct {
 type Instance interface {
 	Name() string
 	SetLabel(key, value string) error
+	RemoveLabel(key string) error
+	Prefix() string
 }
 
 // Claim an existing namespace in all clusters, or create a new one if doesn't exist.

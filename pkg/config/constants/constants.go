@@ -42,6 +42,9 @@ const (
 	// ConfigPathDir config directory for storing envoy json config files.
 	ConfigPathDir = "./etc/istio/proxy"
 
+	// IstioDataDir is the directory to store binary data such as envoy core dump, profile, and downloaded Wasm modules.
+	IstioDataDir = "/var/lib/istio/data"
+
 	// BinaryPathFilename envoy binary location
 	BinaryPathFilename = "/usr/local/bin/envoy"
 
@@ -94,13 +97,16 @@ const (
 	// This is typically set by the downward API
 	PodInfoCPURequestsPath = "./etc/istio/pod/cpu-request"
 
-	// PodInfoCPULimitsPath is the filepath that pod CPU requests will be stored
+	// PodInfoCPULimitsPath is the filepath that pod CPU limits will be stored
 	// This is typically set by the downward API
 	PodInfoCPULimitsPath = "./etc/istio/pod/cpu-limit"
 
 	// DefaultSdsUdsPath is the path used for SDS communication between istio-agent and proxy during
 	// mtls.
 	DefaultSdsUdsPath = "unix:./etc/istio/proxy/SDS"
+
+	// DefaultXdsUdsPath is the path used for XDS communication between istio-agent and proxy
+	DefaultXdsUdsPath = "./etc/istio/proxy/XDS"
 
 	// DefaultServiceAccountName is the default service account to use for remote cluster access.
 	DefaultServiceAccountName = "istio-reader-service-account"
@@ -122,4 +128,9 @@ const (
 	LocalPathStorageNamespace string = "local-path-storage"
 
 	TestVMLabel = "istio.io/test-vm"
+
+	TestVMVersionLabel = "istio.io/test-vm-version"
+
+	// TrustworthyJWTPath is the defaut 3P token to authenticate with third party services
+	TrustworthyJWTPath = "./var/run/secrets/tokens/istio-token"
 )

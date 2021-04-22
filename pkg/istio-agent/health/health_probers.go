@@ -26,6 +26,8 @@ import (
 	"time"
 
 	"istio.io/api/networking/v1alpha3"
+	"istio.io/istio/pilot/cmd/pilot-agent/status"
+	"istio.io/istio/pilot/cmd/pilot-agent/status/ready"
 	"istio.io/istio/pkg/test/echo/common/scheme"
 	"istio.io/pkg/log"
 )
@@ -52,20 +54,14 @@ func (p *ProbeResult) IsHealthy() bool {
 	return *p == Healthy
 }
 
-func (p *ProbeResult) IsUnhealthy() bool {
-	return *p == Unhealthy
-}
-
-func (p *ProbeResult) IsUnknown() bool {
-	return *p == Unknown
-}
-
 type HTTPProber struct {
 	Config    *v1alpha3.HTTPHealthCheckConfig
 	Transport *http.Transport
 }
 
-func NewHTTPProber(cfg *v1alpha3.HTTPHealthCheckConfig) *HTTPProber {
+var _ Prober = &HTTPProber{}
+
+func NewHTTPProber(cfg *v1alpha3.HTTPHealthCheckConfig, ipv6 bool) *HTTPProber {
 	h := new(HTTPProber)
 	h.Config = cfg
 
@@ -81,6 +77,13 @@ func NewHTTPProber(cfg *v1alpha3.HTTPHealthCheckConfig) *HTTPProber {
 			DisableKeepAlives: true,
 		}
 	}
+	d := &net.Dialer{
+		LocalAddr: status.UpstreamLocalAddressIPv4,
+	}
+	if ipv6 {
+		d.LocalAddr = status.UpstreamLocalAddressIPv6
+	}
+	h.Transport.DialContext = d.DialContext
 	return h
 }
 
@@ -144,6 +147,8 @@ type TCPProber struct {
 	Config *v1alpha3.TCPHealthCheckConfig
 }
 
+var _ Prober = &TCPProber{}
+
 func (t *TCPProber) Probe(timeout time.Duration) (ProbeResult, error) {
 	// if we cant connect, count as fail
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%v", t.Config.Host, t.Config.Port), timeout)
@@ -161,6 +166,8 @@ type ExecProber struct {
 	Config *v1alpha3.ExecHealthCheckConfig
 }
 
+var _ Prober = &ExecProber{}
+
 func (e *ExecProber) Probe(timeout time.Duration) (ProbeResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -172,6 +179,35 @@ func (e *ExecProber) Probe(timeout time.Duration) (ProbeResult, error) {
 		default:
 		}
 		return Unhealthy, err
+	}
+	return Healthy, nil
+}
+
+type EnvoyProber struct {
+	Config ready.Prober
+}
+
+var _ Prober = &EnvoyProber{}
+
+func (a EnvoyProber) Probe(time.Duration) (ProbeResult, error) {
+	if err := a.Config.Check(); err != nil {
+		return Unhealthy, err
+	}
+	return Healthy, nil
+}
+
+type AggregateProber struct {
+	Probes []Prober
+}
+
+var _ Prober = &AggregateProber{}
+
+func (a AggregateProber) Probe(timeout time.Duration) (ProbeResult, error) {
+	for _, probe := range a.Probes {
+		res, err := probe.Probe(timeout)
+		if err != nil || !res.IsHealthy() {
+			return res, err
+		}
 	}
 	return Healthy, nil
 }

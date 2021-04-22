@@ -19,17 +19,17 @@ import (
 	"sync"
 
 	v1 "k8s.io/api/core/v1"
-	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/tools/cache"
 
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/kube"
+	"istio.io/istio/pilot/pkg/serviceregistry/kube/controller/filter"
 	"istio.io/istio/pilot/pkg/util/sets"
 )
 
 // PodCache is an eventually consistent pod cache
 type PodCache struct {
-	informer cache.SharedIndexInformer
+	informer filter.FilteredSharedIndexInformer
 
 	sync.RWMutex
 	// podsByIP maintains stable pod IP to name key mapping
@@ -49,9 +49,9 @@ type PodCache struct {
 	c *Controller
 }
 
-func newPodCache(c *Controller, informer coreinformers.PodInformer, queueEndpointEvent func(string)) *PodCache {
+func newPodCache(c *Controller, informer filter.FilteredSharedIndexInformer, queueEndpointEvent func(string)) *PodCache {
 	out := &PodCache{
-		informer:           informer.Informer(),
+		informer:           informer,
 		c:                  c,
 		podsByIP:           make(map[string]string),
 		IPByPods:           make(map[string]string),
@@ -60,6 +60,43 @@ func newPodCache(c *Controller, informer coreinformers.PodInformer, queueEndpoin
 	}
 
 	return out
+}
+
+// copy from kubernetes/pkg/api/v1/pod/utils.go
+func IsPodReady(pod *v1.Pod) bool {
+	return IsPodReadyConditionTrue(pod.Status)
+}
+
+// IsPodReadyConditionTrue returns true if a pod is ready; false otherwise.
+func IsPodReadyConditionTrue(status v1.PodStatus) bool {
+	condition := GetPodReadyCondition(status)
+	return condition != nil && condition.Status == v1.ConditionTrue
+}
+
+func GetPodReadyCondition(status v1.PodStatus) *v1.PodCondition {
+	_, condition := GetPodCondition(&status, v1.PodReady)
+	return condition
+}
+
+func GetPodCondition(status *v1.PodStatus, conditionType v1.PodConditionType) (int, *v1.PodCondition) {
+	if status == nil {
+		return -1, nil
+	}
+	return GetPodConditionFromList(status.Conditions, conditionType)
+}
+
+// GetPodConditionFromList extracts the provided condition from the given list of condition and
+// returns the index of the condition and the condition. Returns -1 and nil if the condition is not present.
+func GetPodConditionFromList(conditions []v1.PodCondition, conditionType v1.PodConditionType) (int, *v1.PodCondition) {
+	if conditions == nil {
+		return -1, nil
+	}
+	for i := range conditions {
+		if conditions[i].Type == conditionType {
+			return i, &conditions[i]
+		}
+	}
+	return -1, nil
 }
 
 // onEvent updates the IP-based index (pc.podsByIP).
@@ -94,6 +131,9 @@ func (pc *PodCache) onEvent(curr interface{}, ev model.Event) error {
 					// add to cache if the pod is running or pending
 					pc.update(ip, key)
 				}
+				if !IsPodReady(pod) {
+					ev = model.EventDelete
+				}
 			}
 		case model.EventUpdate:
 			if pod.DeletionTimestamp != nil {
@@ -109,12 +149,15 @@ func (pc *PodCache) onEvent(curr interface{}, ev model.Event) error {
 						// add to cache if the pod is running or pending
 						pc.update(ip, key)
 					}
-
+					if !IsPodReady(pod) {
+						ev = model.EventDelete
+					}
 				default:
 					// delete if the pod switched to other states and is in the cache
 					if pc.podsByIP[ip] == key {
 						pc.deleteIP(ip)
 					}
+					ev = model.EventDelete
 				}
 			}
 		case model.EventDelete:
@@ -227,7 +270,7 @@ func (pc *PodCache) getPodByIP(addr string) *v1.Pod {
 
 // getPodByKey returns the pod by key formatted `ns/name`
 func (pc *PodCache) getPodByKey(key string) *v1.Pod {
-	item, _, _ := pc.informer.GetStore().GetByKey(key)
+	item, _, _ := pc.informer.GetIndexer().GetByKey(key)
 	if item != nil {
 		return item.(*v1.Pod)
 	}

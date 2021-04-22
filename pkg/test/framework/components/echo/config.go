@@ -21,8 +21,30 @@ import (
 	"github.com/mitchellh/copystructure"
 
 	"istio.io/istio/pkg/test/echo/common"
+	"istio.io/istio/pkg/test/framework/components/cluster"
 	"istio.io/istio/pkg/test/framework/components/namespace"
-	"istio.io/istio/pkg/test/framework/resource"
+)
+
+// Cluster that can deploy echo instances.
+// TODO putting this here for now to deal with circular imports, needs to be moved
+type Cluster interface {
+	cluster.Cluster
+
+	CanDeploy(Config) (Config, bool)
+}
+
+type VMDistro = string
+
+const (
+	UbuntuXenial VMDistro = "UbuntuXenial"
+	UbuntuFocal  VMDistro = "UbuntuFocal"
+	UbuntuBionic VMDistro = "UbuntuBionic"
+	Debian9      VMDistro = "Debian9"
+	Debian10     VMDistro = "Debian10"
+	Centos7      VMDistro = "Centos7"
+	Centos8      VMDistro = "Centos8"
+
+	DefaultVMDistro = UbuntuBionic
 )
 
 // Config defines the options for creating an Echo component.
@@ -49,6 +71,10 @@ type Config struct {
 	// Headless (k8s only) indicates that no ClusterIP should be specified.
 	Headless bool
 
+	// StaticAddress for some echo implementations is an address locally reachable within
+	// the test framework and from the echo Cluster's network.
+	StaticAddresses []string
+
 	// ServiceAccount (k8s only) indicates that a service account should be created
 	// for the deployment.
 	ServiceAccount bool
@@ -73,7 +99,7 @@ type Config struct {
 	Subsets []SubsetConfig
 
 	// Cluster to be used in a multicluster environment
-	Cluster resource.Cluster
+	Cluster cluster.Cluster
 
 	// TLS settings for echo server
 	TLSSettings *common.TLSSettings
@@ -85,8 +111,8 @@ type Config struct {
 	// If enabled, ISTIO_META_AUTO_REGISTER_GROUP will be set on the VM and the WorkloadEntry will be created automatically.
 	AutoRegisterVM bool
 
-	// The image name to be used to pull the image for the VM. `DeployAsVM` must be enabled.
-	VMImage string
+	// The distro to use for a VM. For fake VMs, this maps to docker images.
+	VMDistro VMDistro
 
 	// The set of environment variables to set for `DeployAsVM` instances.
 	VMEnvironment map[string]string
@@ -126,6 +152,8 @@ func (c Config) FQDN() string {
 	out := c.Service
 	if c.Namespace != nil {
 		out += "." + c.Namespace.Name() + ".svc"
+	} else {
+		out += ".default.svc"
 	}
 	if c.Domain != "" {
 		out += "." + c.Domain
@@ -141,12 +169,35 @@ func (c Config) HostHeader() string {
 	return c.FQDN()
 }
 
+func (c Config) IsHeadless() bool {
+	return c.Headless
+}
+
+func (c Config) IsNaked() bool {
+	return len(c.Subsets) > 0 && c.Subsets[0].Annotations != nil && !c.Subsets[0].Annotations.GetBool(SidecarInject)
+}
+
+func (c Config) IsTProxy() bool {
+	// TODO this could be HasCustomInjectionMode
+	return len(c.Subsets) > 0 && c.Subsets[0].Annotations != nil && c.Subsets[0].Annotations.Get(SidecarInterceptionMode) == "TPROXY"
+}
+
+func (c Config) IsVM() bool {
+	return c.DeployAsVM
+}
+
 // DeepCopy creates a clone of IstioEndpoint.
 func (c Config) DeepCopy() Config {
-	newc := copyInternal(c).(Config)
+	newc := c
+	newc.Cluster = nil
+	newc = copyInternal(newc).(Config)
 	newc.Cluster = c.Cluster
 	newc.Namespace = c.Namespace
 	return newc
+}
+
+func (c Config) IsExternal() bool {
+	return c.HostHeader() != c.FQDN()
 }
 
 func copyInternal(v interface{}) interface{} {

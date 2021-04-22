@@ -63,9 +63,11 @@ istioctl experimental precheck.
   istioctl verify-install -f $HOME/istio.yaml
 
   # Verify the deployment matches the Istio Operator deployment definition
-  istioctl verify-install --revision <canary>`,
-		Args: func(cmd *cobra.Command, args []string) error {
+  istioctl verify-install --revision <canary>
 
+  # Verify the installation of specific revision
+  istioctl verify-install -r 1-9-0`,
+		Args: func(cmd *cobra.Command, args []string) error {
 			if len(filenames) > 0 && opts.Revision != "" {
 				cmd.Println(cmd.UsageString())
 				return fmt.Errorf("supply either a file or revision, but not both")
@@ -93,9 +95,5 @@ istioctl experimental precheck.
 }
 
 func strPtr(val string) *string {
-	return &val
-}
-
-func boolPtr(val bool) *bool {
 	return &val
 }

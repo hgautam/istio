@@ -15,7 +15,6 @@
 package bootstrap
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -31,10 +30,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 
+	"istio.io/api/security/v1beta1"
 	"istio.io/istio/pilot/pkg/features"
-	"istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
+	securityModel "istio.io/istio/pilot/pkg/security/model"
 	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/jwt"
 	kubelib "istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/security"
 	"istio.io/istio/security/pkg/cmd"
 	"istio.io/istio/security/pkg/pki/ca"
 	"istio.io/istio/security/pkg/pki/ra"
@@ -51,7 +53,7 @@ type caOptions struct {
 	// domain to use in SPIFFE identity URLs
 	TrustDomain    string
 	Namespace      string
-	Authenticators []authenticate.Authenticator
+	Authenticators []security.Authenticator
 }
 
 // Based on istio_ca main - removing creation of Secrets with private keys in all namespaces and install complexity.
@@ -117,9 +119,6 @@ var (
 	k8sInCluster = env.RegisterStringVar("KUBERNETES_SERVICE_HOST", "",
 		"Kuberenetes service host, set automatically when running in-cluster")
 
-	// ThirdPartyJWTPath is the well-known location of the projected K8S JWT. This is mounted on all workloads, as well as istiod.
-	ThirdPartyJWTPath = "./var/run/secrets/tokens/istio-token"
-
 	// This value can also be extracted from the mounted token
 	trustedIssuer = env.RegisterStringVar("TOKEN_ISSUER", "",
 		"OIDC token issuer. If set, will be used to check the tokens.")
@@ -178,7 +177,7 @@ func (s *Server) RunCA(grpc *grpc.Server, ca caserver.CertificateAuthority, opts
 	iss := trustedIssuer.Get()
 	aud := audience.Get()
 
-	token, err := ioutil.ReadFile(s.jwtPath)
+	token, err := ioutil.ReadFile(getJwtPath())
 	if err == nil {
 		tok, err := detectAuthEnv(string(token))
 		if err != nil {
@@ -208,7 +207,8 @@ func (s *Server) RunCA(grpc *grpc.Server, ca caserver.CertificateAuthority, opts
 		k8sInCluster.Get() == "" { // not running in cluster - in cluster use direct call to apiserver
 		// Add a custom authenticator using standard JWT validation, if not running in K8S
 		// When running inside K8S - we can use the built-in validator, which also check pod removal (invalidation).
-		oidcAuth, err := authenticate.NewJwtAuthenticator(iss, opts.TrustDomain, aud)
+		jwtRule := v1beta1.JWTRule{Issuer: iss, Audiences: []string{aud}}
+		oidcAuth, err := authenticate.NewJwtAuthenticator(&jwtRule, opts.TrustDomain)
 		if err == nil {
 			caServer.Authenticators = append(caServer.Authenticators, oidcAuth)
 			log.Info("Using out-of-cluster JWT authentication")
@@ -248,60 +248,6 @@ func detectAuthEnv(jwt string) (*authenticate.JwtPayload, error) {
 	}
 
 	return structuredPayload, nil
-}
-
-// Save the root public key file and initialize the path the the file, to be used by other
-// components.
-func (s *Server) initPublicKey() error {
-	// Setup the root cert chain and caBundlePath - before calling initDNSListener.
-	if features.PilotCertProvider.Get() == KubernetesCAProvider {
-		s.caBundlePath = defaultCACertPath
-	} else if features.PilotCertProvider.Get() == IstiodCAProvider {
-		signingKeyFile := path.Join(LocalCertDir.Get(), "ca-key.pem")
-		if _, err := os.Stat(signingKeyFile); err != nil {
-			// When Citadel is configured to use self-signed certs, keep a local copy so other
-			// components can load it via file (e.g. webhook config controller).
-			if err := os.MkdirAll(dnsCertDir, 0700); err != nil {
-				return err
-			}
-			// We have direct access to the self-signed
-			internalSelfSignedRootPath := path.Join(dnsCertDir, "self-signed-root.pem")
-
-			rootCert := s.CA.GetCAKeyCertBundle().GetRootCertPem()
-			if err = ioutil.WriteFile(internalSelfSignedRootPath, rootCert, 0600); err != nil {
-				return err
-			}
-
-			s.caBundlePath = internalSelfSignedRootPath
-			s.addStartFunc(func(stop <-chan struct{}) error {
-				go func() {
-					for {
-						select {
-						case <-stop:
-							return
-						case <-time.After(controller.NamespaceResyncPeriod):
-							newRootCert := s.CA.GetCAKeyCertBundle().GetRootCertPem()
-							if !bytes.Equal(rootCert, newRootCert) {
-								rootCert = newRootCert
-								if err = ioutil.WriteFile(internalSelfSignedRootPath, rootCert, 0600); err != nil {
-									log.Errorf("Failed to update local copy of self-signed root: %v", err)
-								} else {
-									log.Info("Updtaed local copy of self-signed root")
-								}
-							}
-						}
-					}
-				}()
-				return nil
-			})
-
-		} else {
-			s.caBundlePath = path.Join(LocalCertDir.Get(), "cert-chain.pem")
-		}
-	} else {
-		s.caBundlePath = path.Join(features.PilotCertProvider.Get(), "cert-chain.pem")
-	}
-	return nil
 }
 
 // loadRemoteCACerts mounts an existing cacerts Secret if the files aren't mounted locally.
@@ -386,9 +332,7 @@ func (s *Server) createIstioCA(client corev1.CoreV1Interface, opts *caOptions) (
 		// The cert corresponding to the key, self-signed or chain.
 		// rootCertFile will be added at the end, if present, to form 'rootCerts'.
 		signingCertFile := path.Join(LocalCertDir.Get(), "ca-cert.pem")
-		//
 		certChainFile := path.Join(LocalCertDir.Get(), "cert-chain.pem")
-		s.caBundlePath = certChainFile
 		caOpts, err = ca.NewPluggedCertIstioCAOptions(certChainFile, signingCertFile, signingKeyFile,
 			rootCertFile, workloadCertTTL.Get(), maxWorkloadCertTTL.Get(), caRSAKeySize.Get())
 		if err != nil {
@@ -413,7 +357,6 @@ func (s *Server) createIstioCA(client corev1.CoreV1Interface, opts *caOptions) (
 // the caOptions defines the external provider
 func (s *Server) createIstioRA(client kubelib.Client,
 	opts *caOptions) (ra.RegistrationAuthority, error) {
-
 	caCertFile := path.Join(ra.DefaultExtCACertDir, constants.CACertNamespaceConfigMapDataName)
 	if _, err := os.Stat(caCertFile); err != nil {
 		caCertFile = defaultCACertPath
@@ -426,7 +369,21 @@ func (s *Server) createIstioRA(client kubelib.Client,
 		CaCertFile:     caCertFile,
 		VerifyAppendCA: true,
 		K8sClient:      client.CertificatesV1beta1(),
+		TrustDomain:    opts.TrustDomain,
 	}
 	return ra.NewIstioRA(raOpts)
+}
 
+// getJwtPath returns jwt path.
+func getJwtPath() string {
+	log.Info("JWT policy is ", features.JwtPolicy.Get())
+	switch features.JwtPolicy.Get() {
+	case jwt.PolicyThirdParty:
+		return securityModel.K8sSATrustworthyJwtFileName
+	case jwt.PolicyFirstParty:
+		return securityModel.K8sSAJwtFileName
+	default:
+		log.Infof("unknown JWT policy %v, default to certificates ", features.JwtPolicy.Get())
+		return ""
+	}
 }

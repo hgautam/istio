@@ -353,3 +353,103 @@ messages:
     level: Warning
     description: "Virtual IP addresses are required for ports serving TCP (or unset) protocol"
     template: "ServiceEntry addresses are required for this protocol."
+
+  - name: "DeprecatedAnnotation"
+    code: IST0135
+    level: Info
+    description: "A resource is using a deprecated Istio annotation."
+    template: "Annotation %q has been deprecated and may not work in future Istio versions."
+    args:
+      - name: annotation
+        type: string
+
+  - name: "AlphaAnnotation"
+    code: IST0136
+    level: Info
+    description: "An Istio annotation may not be suitable for production."
+    template: "Annotation %q is part of an alpha-phase feature and may be incompletely supported."
+    args:
+      - name: annotation
+        type: string
+
+  - name: "DeploymentConflictingPorts"
+    code: IST0137
+    level: Warning
+    description: "Two services selecting the same workload with the same targetPort MUST refer to the same port."
+    template: "This deployment %s is associated with multiple services %v using targetPort %q but different ports: %v."
+    args:
+      - name: deployment
+        type: string
+      - name: services
+        type: "[]string"
+      - name: targetPort
+        type: string
+      - name: ports
+        type: "[]int32"
+
+# https://github.com/envoyproxy/envoy/issues/6767
+  - name: "GatewayDuplicateCertificate"
+    code: IST0138
+    level: Warning
+    description: "Duplicate certificate in multiple gateways may cause 404s if clients re-use HTTP2 connections."
+    template: "Duplicate certificate in multiple gateways %v may cause 404s if clients re-use HTTP2 connections."
+    args:
+      - name: gateways
+        type: "[]string"
+
+  - name: "InvalidWebhook"
+    code: IST0139
+    level: Error
+    description: "Webhook is invalid or references a control plane service that does not exist."
+    template: "%v"
+    args:
+      - name: error
+        type: string
+
+  - name: "IngressRouteRulesNotAffected"
+    code: IST0140
+    level: Warning
+    description: "Route rules have no effect on ingress gateway requests"
+    template: "Subset in virtual service %s has no effect on ingress gateway %s requests"
+    args:
+      - name: virtualservicesubset
+        type: string
+      - name: virtualservice
+        type: string
+
+  - name: "InsufficientPermissions"
+    code: IST0141
+    level: Error
+    description: "Required permissions to install Istio are missing."
+    template: "Missing required permission to create resource %v (%v)"
+    args:
+      - name: resource
+        type: string
+      - name: error
+        type: string
+
+  - name: "UnsupportedKubernetesVersion"
+    code: IST0142
+    level: Error
+    description: "The Kubernetes version is not supported"
+    template: "The Kubernetes Version %q is lower than the minimum version: %v"
+    args:
+      - name: version
+        type: string
+      - name: minimumVersion
+        type: string
+
+  - name: "LocalhostListener"
+    code: IST0143
+    level: Error
+    description: "A port exposed in a Service is bound to a localhost address"
+    template: "Port %v is exposed in a Service but listens on localhost. It will not be exposed to other pods."
+    args:
+      - name: port
+        type: string
+
+  - name: "InvalidApplicationUID"
+    code: IST0144
+    level: Warning
+    description: "Application pods should not run as user ID (UID) 1337"
+    template: "User ID (UID) 1337 is reserved for the sidecar proxy."

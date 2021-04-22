@@ -15,9 +15,8 @@
 package sanitycheck
 
 import (
-	"testing"
-
 	"istio.io/istio/pkg/config/protocol"
+	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/echo"
 	"istio.io/istio/pkg/test/framework/components/echo/echoboot"
 	"istio.io/istio/pkg/test/framework/components/namespace"
@@ -26,8 +25,13 @@ import (
 )
 
 // RunTrafficTest deploys echo server/client and runs an Istio traffic test
-func RunTrafficTest(t *testing.T, ctx resource.Context) {
+func RunTrafficTest(t framework.TestContext, ctx resource.Context) {
 	scopes.Framework.Infof("running sanity test")
+	client, server := SetupTrafficTest(t, ctx)
+	RunTrafficTestClientServer(t, client, server)
+}
+
+func SetupTrafficTest(t framework.TestContext, ctx resource.Context) (echo.Instance, echo.Instance) {
 	var client, server echo.Instance
 	test := namespace.NewOrFail(t, ctx, namespace.Config{
 		Prefix: "default",
@@ -47,9 +51,15 @@ func RunTrafficTest(t *testing.T, ctx resource.Context) {
 					Name:         "http",
 					Protocol:     protocol.HTTP,
 					InstancePort: 8090,
-				}},
+				},
+			},
 		}).
 		BuildOrFail(t)
+
+	return client, server
+}
+
+func RunTrafficTestClientServer(t framework.TestContext, client, server echo.Instance) {
 	_ = client.CallWithRetryOrFail(t, echo.CallOptions{
 		Target:    server,
 		PortName:  "http",

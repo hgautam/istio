@@ -34,7 +34,6 @@ import (
 
 	analyzer_util "istio.io/istio/galley/pkg/config/analysis/analyzers/util"
 	"istio.io/istio/operator/pkg/util"
-	"istio.io/istio/pkg/config/resource"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/proxy"
 	"istio.io/istio/tools/bug-report/pkg/archive"
@@ -109,10 +108,15 @@ func runBugReportCommand(_ *cobra.Command, logOpts *log.Options) error {
 	if err != nil {
 		return err
 	}
-
-	clusterCtxStr, err := content.GetClusterContext()
-	if err != nil {
-		return err
+	clusterCtxStr := ""
+	if config.Context == "" {
+		var err error
+		clusterCtxStr, err = content.GetClusterContext(config.KubeConfigPath)
+		if err != nil {
+			return err
+		}
+	} else {
+		clusterCtxStr = config.Context
 	}
 
 	common.LogAndPrintf("\nTarget cluster context: %s\n", clusterCtxStr)
@@ -161,7 +165,7 @@ func runBugReportCommand(_ *cobra.Command, logOpts *log.Options) error {
 		log.Errorf("using ./ to write archive: %s", err.Error())
 		outDir = "."
 	}
-	outPath := filepath.Join(outDir, "bug-report.tgz")
+	outPath := filepath.Join(outDir, "bug-report.tar.gz")
 	common.LogAndPrintf("Creating an archive at %s.\n", outPath)
 
 	archiveDir := archive.DirToArchive(tempDir)
@@ -269,6 +273,7 @@ func gatherInfo(client kube.ExtendedClient, config *config.BugReportConfig, reso
 	getFromCluster(content.GetCRs, params, clusterDir, &mandatoryWg)
 	getFromCluster(content.GetEvents, params, clusterDir, &mandatoryWg)
 	getFromCluster(content.GetClusterInfo, params, clusterDir, &mandatoryWg)
+	getFromCluster(content.GetNodeInfo, params, clusterDir, &mandatoryWg)
 	getFromCluster(content.GetSecrets, params.SetVerbose(config.FullSecrets), clusterDir, &mandatoryWg)
 	getFromCluster(content.GetDescribePods, params.SetIstioNamespace(config.IstioNamespace), clusterDir, &mandatoryWg)
 
@@ -312,7 +317,7 @@ func gatherInfo(client kube.ExtendedClient, config *config.BugReportConfig, reso
 	<-cmdTimer.C
 
 	// Analyze runs many queries internally, so run these queries sequentially and after everything else has finished.
-	runAnalyze(config, resources, params)
+	runAnalyze(config, params)
 }
 
 // getFromCluster runs a cluster info fetching function f against the cluster and writes the results to fileName.
@@ -401,20 +406,18 @@ func getLog(client kube.ExtendedClient, resources *cluster2.Resources, config *c
 	return clog, cstat, cstat.Importance(), nil
 }
 
-func runAnalyze(config *config.BugReportConfig, resources *cluster2.Resources, params *content.Params) {
-	for ns := range resources.Root {
-		if analyzer_util.IsSystemNamespace(resource.Namespace(ns)) {
-			continue
-		}
-		common.LogAndPrintf("Running istio analyze on namespace %s.\n", ns)
-		out, err := content.GetAnalyze(params.SetIstioNamespace(config.IstioNamespace))
-		if err != nil {
-			log.Error(err.Error())
-			continue
-		}
-		writeFiles(archive.AnalyzePath(tempDir, ns), out)
+func runAnalyze(config *config.BugReportConfig, params *content.Params) {
+	newParam := params.SetNamespace(common.NamespaceAll)
+	common.LogAndPrintf("Running istio analyze on all namespaces and report as below:")
+	out, err := content.GetAnalyze(newParam.SetIstioNamespace(config.IstioNamespace))
+	if err != nil {
+		log.Error(err.Error())
+		return
 	}
+	common.LogAndPrintf("\nAnalysis Report:\n")
+	common.LogAndPrintf(out[common.StrNamespaceAll])
 	common.LogAndPrintf("\n")
+	writeFiles(archive.AnalyzePath(tempDir, common.StrNamespaceAll), out)
 }
 
 func writeFiles(dir string, files map[string]string) {
@@ -428,13 +431,13 @@ func writeFile(path, text string) {
 		return
 	}
 	mkdirOrExit(path)
-	if err := ioutil.WriteFile(path, []byte(text), 0644); err != nil {
+	if err := ioutil.WriteFile(path, []byte(text), 0o644); err != nil {
 		log.Errorf(err.Error())
 	}
 }
 
 func mkdirOrExit(fpath string) {
-	if err := os.MkdirAll(path.Dir(fpath), 0755); err != nil {
+	if err := os.MkdirAll(path.Dir(fpath), 0o755); err != nil {
 		fmt.Printf("Could not create output directories: %s", err)
 		os.Exit(-1)
 	}

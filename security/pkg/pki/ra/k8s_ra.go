@@ -16,12 +16,12 @@ package ra
 
 import (
 	"fmt"
-	"time"
 
 	cert "k8s.io/api/certificates/v1beta1"
 	certclient "k8s.io/client-go/kubernetes/typed/certificates/v1beta1"
 
 	"istio.io/istio/security/pkg/k8s/chiron"
+	"istio.io/istio/security/pkg/pki/ca"
 	raerror "istio.io/istio/security/pkg/pki/error"
 	"istio.io/istio/security/pkg/pki/util"
 )
@@ -29,7 +29,7 @@ import (
 // KubernetesRA integrated with an external CA using Kubernetes CSR API
 type KubernetesRA struct {
 	csrInterface  certclient.CertificatesV1beta1Interface
-	keyCertBundle util.KeyCertBundle
+	keyCertBundle *util.KeyCertBundle
 	raOpts        *IstioRAOptions
 }
 
@@ -39,9 +39,11 @@ func NewKubernetesRA(raOpts *IstioRAOptions) (*KubernetesRA, error) {
 	if err != nil {
 		return nil, raerror.NewError(raerror.CAInitFail, fmt.Errorf("error processing Certificate Bundle for Kubernetes RA"))
 	}
-	istioRA := &KubernetesRA{csrInterface: raOpts.K8sClient,
+	istioRA := &KubernetesRA{
+		csrInterface:  raOpts.K8sClient,
 		raOpts:        raOpts,
-		keyCertBundle: keyCertBundle}
+		keyCertBundle: keyCertBundle,
+	}
 	return istioRA, nil
 }
 
@@ -64,39 +66,19 @@ func (r *KubernetesRA) kubernetesSign(csrPEM []byte, csrName string, caCertFile 
 	return certChain, err
 }
 
-// Sign takes a PEM-encoded CSR, subject IDs and lifetime, and returns a certificate signed by k8s CA.
-func (r *KubernetesRA) Sign(csrPEM []byte, subjectIDs []string, requestedLifetime time.Duration, forCA bool) ([]byte, error) {
-
-	if forCA {
-		return nil, raerror.NewError(raerror.CSRError, fmt.Errorf(
-			"unable to generate CA certifificates"))
-	}
-
-	if !ValidateCSR(csrPEM, subjectIDs) {
-		return nil, raerror.NewError(raerror.CSRError, fmt.Errorf(
-			"unable to validate SAN Identities in CSR"))
-	}
-
-	// TODO: Need to pass the lifetime into the CSR.
-	/*	If the requested requestedLifetime is non-positive, apply the default TTL.
-			lifetime := requestedLifetime
-			if requestedLifetime.Seconds() <= 0 {
-				lifetime = ra.defaultCertTTL
-		}
-	*/
-
-	// If the requested TTL is greater than maxCertTTL, return an error
-	if requestedLifetime.Seconds() > r.raOpts.MaxCertTTL.Seconds() {
-		return nil, raerror.NewError(raerror.TTLError, fmt.Errorf(
-			"requested TTL %s is greater than the max allowed TTL %s", requestedLifetime, r.raOpts.MaxCertTTL))
+// Sign takes a PEM-encoded CSR and cert opts, and returns a certificate signed by k8s CA.
+func (r *KubernetesRA) Sign(csrPEM []byte, certOpts ca.CertOpts) ([]byte, error) {
+	_, err := preSign(r.raOpts, csrPEM, certOpts.SubjectIDs, certOpts.TTL, certOpts.ForCA)
+	if err != nil {
+		return nil, err
 	}
 	csrName := chiron.GenCsrName()
 	return r.kubernetesSign(csrPEM, csrName, r.raOpts.CaCertFile)
 }
 
 // SignWithCertChain is similar to Sign but returns the leaf cert and the entire cert chain.
-func (r *KubernetesRA) SignWithCertChain(csrPEM []byte, subjectIDs []string, ttl time.Duration, forCA bool) ([]byte, error) {
-	cert, err := r.Sign(csrPEM, subjectIDs, ttl, forCA)
+func (r *KubernetesRA) SignWithCertChain(csrPEM []byte, certOpts ca.CertOpts) ([]byte, error) {
+	cert, err := r.Sign(csrPEM, certOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -108,6 +90,6 @@ func (r *KubernetesRA) SignWithCertChain(csrPEM []byte, subjectIDs []string, ttl
 }
 
 // GetCAKeyCertBundle returns the KeyCertBundle for the CA.
-func (r *KubernetesRA) GetCAKeyCertBundle() util.KeyCertBundle {
+func (r *KubernetesRA) GetCAKeyCertBundle() *util.KeyCertBundle {
 	return r.keyCertBundle
 }

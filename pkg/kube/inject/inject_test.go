@@ -60,6 +60,7 @@ func TestInjection(t *testing.T) {
 			setFlags: []string{
 				"components.cni.enabled=true",
 				"values.istio_cni.chained=true",
+				"values.global.network=network1",
 			},
 		},
 		{
@@ -266,6 +267,11 @@ func TestInjection(t *testing.T) {
 			in:   "proxy-override-args.yaml",
 			want: "proxy-override-args.yaml.injected",
 		},
+		{
+			in:         "custom-template.yaml",
+			want:       "custom-template.yaml.injected",
+			inFilePath: "custom-template.iop.yaml",
+		},
 	}
 	// Keep track of tests we add options above
 	// We will search for all test files and skip these ones
@@ -352,7 +358,7 @@ func TestInjection(t *testing.T) {
 				warn := func(s string) {
 					t.Log(s)
 				}
-				if err = IntoResourceFile(sidecarTemplate.Templates, valuesConfig, "", mc, in, &got, warn); err != nil {
+				if err = IntoResourceFile(nil, sidecarTemplate.Templates, valuesConfig, "", mc, in, &got, warn); err != nil {
 					if c.expectedError != "" {
 						if !strings.Contains(strings.ToLower(err.Error()), c.expectedError) {
 							t.Fatalf("expected error %q got %q", c.expectedError, err)
@@ -417,50 +423,84 @@ func testInjectionTemplate(t *testing.T, template, input, expected string) {
 	t.Helper()
 	webhook := &Webhook{
 		Config: &Config{
-			Templates: map[string]string{SidecarTemplateName: template},
-			Policy:    InjectionPolicyEnabled,
+			Templates:        map[string]string{SidecarTemplateName: template},
+			Policy:           InjectionPolicyEnabled,
+			DefaultTemplates: []string{SidecarTemplateName},
 		},
 	}
 	runWebhook(t, webhook, []byte(input), []byte(expected), false)
 }
 
-// TestPodTemplate ensures we can use a legacy pod spec resource as the template schema (rather than Pod)
-func TestPodSpecTemplate(t *testing.T) {
-	testInjectionTemplate(t,
-		`
-containers:
-- name: istio-proxy
-  image: proxy`,
-		`
+func TestMultipleInjectionTemplates(t *testing.T) {
+	webhook := &Webhook{
+		Config: &Config{
+			Templates: map[string]string{
+				"sidecar": `
+spec:
+  containers:
+  - name: istio-proxy
+    image: proxy
+`,
+				"init": `
+spec:
+ initContainers:
+ - name: istio-init
+   image: proxy
+`,
+			},
+			Aliases: map[string][]string{"both": {"sidecar", "init"}},
+			Policy:  InjectionPolicyEnabled,
+		},
+	}
+
+	input := `
 apiVersion: v1
 kind: Pod
 metadata:
   name: hello
+  annotations:
+    inject.istio.io/templates: sidecar,init
 spec:
   containers:
   - name: hello
     image: "fake.docker.io/google-samples/hello-go-gke:1.0"
-`,
-
-		// We expect resources to only have limits, since we had the "replace" directive.
-		// nolint: lll
-		`
+`
+	inputAlias := `
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hello
+  annotations:
+    inject.istio.io/templates: both
+spec:
+  containers:
+  - name: hello
+    image: "fake.docker.io/google-samples/hello-go-gke:1.0"
+`
+	// nolint: lll
+	expected := `
 apiVersion: v1
 kind: Pod
 metadata:
   annotations:
+    inject.istio.io/templates: %s
     prometheus.io/path: /stats/prometheus
     prometheus.io/port: "0"
     prometheus.io/scrape: "true"
     sidecar.istio.io/status: '{"version":"","initContainers":["istio-init"],"containers":["istio-proxy"],"volumes":["istio-envoy","istio-data","istio-podinfo","istio-token","istiod-ca-cert"],"imagePullSecrets":null}'
   name: hello
 spec:
+  initContainers:
+  - name: istio-init
+    image: proxy
   containers:
     - name: hello
       image: fake.docker.io/google-samples/hello-go-gke:1.0
     - name: istio-proxy
       image: proxy
-`)
+`
+	runWebhook(t, webhook, []byte(input), []byte(fmt.Sprintf(expected, "sidecar,init")), false)
+	runWebhook(t, webhook, []byte(inputAlias), []byte(fmt.Sprintf(expected, "both")), false)
 }
 
 // TestStrategicMerge ensures we can use https://github.com/kubernetes/community/blob/master/contributors/devel/sig-api-machinery/strategic-merge-patch.md
@@ -767,6 +807,45 @@ func TestAppendMultusNetwork(t *testing.T) {
 					t.Fatalf("Function is not idempotent.\nExpected:\n%v\nActual:\n%v", tc.want, actual)
 				}
 			})
+		})
+	}
+}
+
+func Test_updateClusterEnvs(t *testing.T) {
+	type args struct {
+		container *corev1.Container
+		newKVs    map[string]string
+	}
+	tests := []struct {
+		name string
+		args args
+		want *corev1.Container
+	}{
+		{
+			args: args{
+				container: &corev1.Container{},
+				newKVs:    parseInjectEnvs("/inject/net/network1/cluster/cluster1"),
+			},
+			want: &corev1.Container{
+				Env: []corev1.EnvVar{
+					{
+						Name:  "ISTIO_META_CLUSTER_ID",
+						Value: "cluster1",
+					},
+					{
+						Name:  "ISTIO_META_NETWORK",
+						Value: "network1",
+					},
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			updateClusterEnvs(tt.args.container, tt.args.newKVs)
+			if !cmp.Equal(tt.args.container.Env, tt.want.Env) {
+				t.Fatalf("updateClusterEnvs got \n%+v, expected \n%+v", tt.args.container.Env, tt.want.Env)
+			}
 		})
 	}
 }

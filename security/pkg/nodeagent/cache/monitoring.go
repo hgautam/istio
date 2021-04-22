@@ -16,14 +16,7 @@ package cache
 
 import "istio.io/pkg/monitoring"
 
-const (
-	TokenExchange = "token_exchange"
-	CSR           = "csr"
-)
-
-var (
-	RequestType = monitoring.MustCreateLabel("request_type")
-)
+var RequestType = monitoring.MustCreateLabel("request_type")
 
 // Metrics for outgoing requests from citadel agent to external services such as token exchange server or a CA.
 // This is different from incoming request metrics (i.e. from Envoy to citadel agent).
@@ -37,11 +30,6 @@ var (
 	numOutgoingRequests = monitoring.NewSum(
 		"num_outgoing_requests",
 		"Number of total outgoing requests (e.g. to a token exchange server, CA, etc.)",
-		monitoring.WithLabels(RequestType))
-
-	numOutgoingRetries = monitoring.NewSum(
-		"num_outgoing_retries",
-		"Number of outgoing retry requests (e.g. to a token exchange server, CA, etc.)",
 		monitoring.WithLabels(RequestType))
 
 	numFailedOutgoingRequests = monitoring.NewSum(
@@ -62,7 +50,6 @@ func init() {
 	monitoring.MustRegister(
 		outgoingLatency,
 		numOutgoingRequests,
-		numOutgoingRetries,
 		numFailedOutgoingRequests,
 		numFileWatcherFailures,
 		numFileSecretFailures,

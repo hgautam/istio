@@ -12,6 +12,7 @@ spec:
   template:
     metadata:
       annotations:
+        kubectl.kubernetes.io/default-container: traffic
         kubectl.kubernetes.io/default-logs-container: traffic
         prometheus.io/path: /stats/prometheus
         prometheus.io/port: "15020"
@@ -52,6 +53,7 @@ spec:
         - traffic.$(POD_NAMESPACE)
         - --proxyLogLevel=warning
         - --proxyComponentLogLevel=misc:error
+        - --log_output_level=default:info
         env:
         - name: JWT_POLICY
           value: third-party-jwt
@@ -115,7 +117,6 @@ spec:
         - name: FOO
           value: bar
         image: gcr.io/istio-testing/proxyv2:latest
-        imagePullPolicy: Always
         name: istio-proxy
         ports:
         - containerPort: 15090
@@ -178,7 +179,6 @@ spec:
         - name: FOO
           value: bar
         image: gcr.io/istio-testing/proxyv2:latest
-        imagePullPolicy: Always
         name: istio-init
         resources:
           requests:

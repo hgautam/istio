@@ -26,6 +26,7 @@ import (
 
 var (
 	inst istio.Instance
+	apps = &util.EchoDeployments{}
 )
 
 func TestMain(m *testing.M) {
@@ -35,8 +36,12 @@ func TestMain(m *testing.M) {
 		NewSuite(m).
 		RequireSingleCluster().
 		Setup(istio.Setup(&inst, setupConfig)).
+		Setup(func(ctx resource.Context) (err error) {
+			// Skip VM as eastwest gateway is disabled.
+			ctx.Settings().SkipVM = true
+			return util.SetupTest(ctx, apps)
+		}).
 		Run()
-
 }
 
 func setupConfig(_ resource.Context, cfg *istio.Config) {
@@ -48,14 +53,15 @@ values:
   global:
     pilotCertProvider: kubernetes
 `
+	cfg.DeployEastWestGW = false
 }
 
 func TestMtlsGatewaysK8sca(t *testing.T) {
 	framework.
 		NewTest(t).
 		Features("security.ingress.mtls.gateway").
-		Run(func(ctx framework.TestContext) {
-			util.RunTestMultiMtlsGateways(ctx, inst)
+		Run(func(t framework.TestContext) {
+			util.RunTestMultiMtlsGateways(t, inst, apps)
 		})
 }
 
@@ -63,7 +69,7 @@ func TestTlsGatewaysK8sca(t *testing.T) {
 	framework.
 		NewTest(t).
 		Features("security.ingress.tls.gateway.K8sca").
-		Run(func(ctx framework.TestContext) {
-			util.RunTestMultiTLSGateways(ctx, inst)
+		Run(func(t framework.TestContext) {
+			util.RunTestMultiTLSGateways(t, inst, apps)
 		})
 }
